@@ -132,14 +132,21 @@ def express_cost(order_total: float) -> float:
             return cost
     return 800
 
+def _get_type_id(obj: dict):
+    """Читает type_id / accrual_id — Ozon переименовал поле 09.06.2026."""
+    v = obj.get("accrual_id")
+    if v is None:
+        v = obj.get("type_id")
+    return v
+
 def collect_store_costs(ops: list[dict]) -> dict[int, float]:
-    """Собирает non_item_fee по type_id — расходы уровня магазина, не привязанные к SKU."""
+    """Собирает non_item_fee по type_id/accrual_id — расходы уровня магазина."""
     totals: dict[int, float] = {}
     for accrual in ops:
         nif = accrual.get("non_item_fee")
         if not isinstance(nif, dict):
             continue
-        tid = nif.get("type_id")
+        tid = _get_type_id(nif)
         if tid is None:
             continue
         amt = float(((nif.get("accrued") or {}).get("amount") or 0))
@@ -474,7 +481,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
             for fee in (sku_fees.get("fees") or []):
                 if not isinstance(fee, dict):
                     continue
-                tid = fee.get("type_id")
+                tid = _get_type_id(fee)
                 amount = float((fee.get("accrued") or {}).get("amount") or 0)
                 known = {ACQUIRING_TYPE_ID, INSTALLMENT_TYPE_ID} | PROMO_TYPE_IDS
                 rows.append({
@@ -1435,6 +1442,17 @@ with tab5:
         st.info("Данные детализации доступны после загрузки в режиме 'Текущий месяц' или 'Произвольные даты'.")
         st.stop()
 
+    # ── Диагностика структуры API ──────────────────────────────────────────────
+    with st.expander("🔧 Диагностика API (структура одного начисления)", expanded=False):
+        import json
+        # Ищем начисление с posting (продажа/возврат) для наглядности
+        sample = next(
+            (a for a in raw_ops if a.get("posting") and (a["posting"].get("products") or [])),
+            raw_ops[0] if raw_ops else {}
+        )
+        st.caption("Первое начисление типа POSTING из API — проверь наличие `delivery.total_accrued`:")
+        st.json(sample, expanded=2)
+
     # Обратный справочник: offer_id → список numeric SKU
     reverse_map: dict[str, list[str]] = {}
     for num_sku, offer_id in sku_map_cache.items():
@@ -1471,7 +1489,7 @@ with tab5:
             for svc in services:
                 if not isinstance(svc, dict):
                     continue
-                tid = svc.get("type_id")
+                tid = _get_type_id(svc)
                 amt = float(((svc.get("accrued") or {}).get("amount") or 0))
                 src = "delivery.services"
                 typeid_totals[(tid, src)] = typeid_totals.get((tid, src), 0) + amt
@@ -1513,7 +1531,7 @@ with tab5:
             for fee in (sku_fees.get("fees") or []):
                 if not isinstance(fee, dict):
                     continue
-                tid = fee.get("type_id")
+                tid = _get_type_id(fee)
                 amt = float(((fee.get("accrued") or {}).get("amount") or 0))
                 src = "item_fees"
                 typeid_totals[(tid, src)] = typeid_totals.get((tid, src), 0) + amt
@@ -1594,7 +1612,7 @@ with tab5:
             for svc in ((prod.get("delivery") or {}).get("services") or []):
                 if not isinstance(svc, dict):
                     continue
-                tid = svc.get("type_id")
+                tid = _get_type_id(svc)
                 amt = float(((svc.get("accrued") or {}).get("amount") or 0))
                 cab_totals[(tid, "delivery.services")] = cab_totals.get((tid, "delivery.services"), 0) + amt
 
@@ -1605,14 +1623,14 @@ with tab5:
             for fee in (sku_fees.get("fees") or []):
                 if not isinstance(fee, dict):
                     continue
-                tid = fee.get("type_id")
+                tid = _get_type_id(fee)
                 amt = float(((fee.get("accrued") or {}).get("amount") or 0))
                 cab_totals[(tid, "item_fees")] = cab_totals.get((tid, "item_fees"), 0) + amt
 
         # non_item_fee — общие сборы на уровне заказа (хранение и т.п.)
         nif = accrual.get("non_item_fee")
-        if isinstance(nif, dict) and nif.get("type_id") is not None:
-            tid = nif.get("type_id")
+        if isinstance(nif, dict) and _get_type_id(nif) is not None:
+            tid = _get_type_id(nif)
             amt = float(((nif.get("accrued") or {}).get("amount") or 0))
             cab_totals[(tid, "non_item_fee")] = cab_totals.get((tid, "non_item_fee"), 0) + amt
 
