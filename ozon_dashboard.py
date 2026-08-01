@@ -946,25 +946,24 @@ if load_btn:
                         if api_type_names:
                             TYPE_NAMES.update(api_type_names)
 
-                    # Загружаем справочник sku → offer_id через FBO/FBS (если есть права)
+                    # Загружаем справочник sku → offer_id
+                    # Сначала быстрый путь: turnover/stocks (Product read-only)
                     with st.spinner("Загружаем справочник артикулов..."):
-                        sku_map = fetch_sku_map(client_id, api_key)
-                    if sku_map:
-                        name_map = fetch_name_map(client_id, api_key)
-                        raw_df = apply_sku_map(raw_df, sku_map, name_map)
-                        st.caption(f"Справочник FBO/FBS: {len(sku_map)} товаров")
+                        _unique_skus = tuple(sorted(raw_df["sku"].unique().tolist())) if "sku" in raw_df.columns else ()
+                        _offer_id_map = fetch_offer_ids_by_sku(client_id, api_key, _unique_skus)
+                    if _offer_id_map:
+                        raw_df["article"] = raw_df["sku"].map(_offer_id_map).fillna(raw_df["article"])
+                        raw_df["article"] = raw_df["article"].astype(str)
+                        sku_map = _offer_id_map
                     else:
-                        # Fallback: Product Info API — по числовым SKU из транзакций
-                        with st.spinner("FBO/FBS недоступен, запрашиваем артикулы через Product API..."):
-                            _unique_skus = tuple(sorted(raw_df["sku"].unique().tolist())) if "sku" in raw_df.columns else ()
-                            _offer_id_map = fetch_offer_ids_by_sku(client_id, api_key, _unique_skus)
-                        if _offer_id_map:
-                            raw_df["article"] = raw_df["sku"].map(_offer_id_map).fillna(raw_df["article"])
-                            raw_df["article"] = raw_df["article"].astype(str)
-                            sku_map = _offer_id_map  # используем как sku_map для Tab5
-                            st.caption(f"Product API: {len(_offer_id_map)} артикулов")
+                        # Запасной путь: FBO/FBS list
+                        with st.spinner("Запрашиваем артикулы через FBO/FBS..."):
+                            sku_map = fetch_sku_map(client_id, api_key)
+                        if sku_map:
+                            name_map = fetch_name_map(client_id, api_key)
+                            raw_df = apply_sku_map(raw_df, sku_map, name_map)
                         else:
-                            st.warning("Не удалось получить артикулы: проверь права API-ключа (нужен доступ к FBO/FBS или Products)")
+                            st.warning("Не удалось получить артикулы: проверь права API-ключа (нужен Product read-only или FBO/FBS)")
 
                     if use_transactions:
                         # Транзакционный режим — логистика уже в raw_df
