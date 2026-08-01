@@ -313,18 +313,51 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     except Exception:
         pass
 
-    # Попытка 2: /v1/product/info — по одному SKU, ТОЛЬКО для тех, что не нашлись выше.
-    missing = [s for s in sku_strings if s not in result]
-    for sku_str in missing[:300]:  # лимит 300, чтобы не перегружать API при больших каталогах
+    def _api_post_silent(endpoint: str, body: dict) -> dict:
+        """Как api_post(), но без st.error — для best-effort догоматчинга, где часть
+        запросов ожидаемо не найдёт товар (устаревший SKU, архив и т.п.)."""
         try:
-            data = api_post("/v1/product/info", {"sku": int(sku_str)}, client_id, api_key)
-            if data:
-                item = data.get("result") or data
-                offer_id = str(item.get("offer_id") or "")
-                if offer_id:
-                    result[sku_str] = offer_id
+            headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
+            resp = requests.post(API_URL + endpoint, json=body, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                return {}
+            return resp.json()
+        except Exception:
+            return {}
+
+    missing = [s for s in sku_strings if s not in result]
+
+    # Попытка 2: /v3/product/info/list — пакетный метод по идентификаторам (пришёл на смену
+    # /v2/product/list, который Ozon отключил в феврале 2025). Схема запроса не была
+    # подтверждена по актуальной документации (не удалось её прочитать), поэтому обёрнуто
+    # в try/except «на всякий случай» — если формат не подойдёт, просто перейдём к попытке 3.
+    if missing:
+        try:
+            for i in range(0, len(missing), 100):
+                batch = [int(s) for s in missing[i:i+100]]
+                data = _api_post_silent("/v3/product/info/list", {"sku": batch})
+                items = ((data or {}).get("items") or []) if isinstance(data, dict) else []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    offer_id = str(item.get("offer_id") or "")
+                    sku_val  = str(item.get("sku") or "") or str(item.get("id") or "")
+                    if offer_id and sku_val:
+                        result[sku_val] = offer_id
         except Exception:
             pass
+
+    # Попытка 3: /v1/product/info — по одному SKU, ТОЛЬКО для тех, что всё ещё не нашлись.
+    # Молча (без st.error): этот метод, похоже, устарел и на многие SKU отвечает 404 —
+    # это ожидаемо для части каталога, не повод показывать пользователю стену ошибок.
+    still_missing = [s for s in sku_strings if s not in result]
+    for sku_str in still_missing[:300]:  # лимит 300, чтобы не перегружать API при больших каталогах
+        data = _api_post_silent("/v1/product/info", {"sku": int(sku_str)})
+        if data:
+            item = data.get("result") or data
+            offer_id = str(item.get("offer_id") or "")
+            if offer_id:
+                result[sku_str] = offer_id
 
     return result
 
