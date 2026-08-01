@@ -314,6 +314,14 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     result = {}
 
     # Попытка 1: /v1/analytics/turnover/stocks — принимает список SKU, возвращает offer_id.
+    # КРИТИЧНО (найдено 02.08.2026 в официальной документации): у этого метода лимит
+    # «не больше 1 запроса в минуту по одному Client-Id» — совсем не как у большинства
+    # других методов (обычно 50 запросов/сек). Раньше код бил список SKU на батчи по 500
+    # и слал их ПОДРЯД без паузы — второй батч почти всегда получал 429, потому что
+    # 60 секунд ещё не прошло. Метод принимает до 1000 SKU за ОДИН запрос, так что почти
+    # всегда достаточно одного вызова. Если SKU больше 1000 — ждём реальную минуту между
+    # батчами (а не короткий backoff из api_post, который тут бесполезен).
+    #
     # ВАЖНО: этот отчёт покрывает только SKU с оборачиваемостью/остатками за период — товары
     # с нулевым остатком/редкими продажами он может не вернуть вообще. Раньше код при ЛЮБОМ
     # непустом результате сразу возвращал его (`if result: return result`) и НИКОГДА не пытался
@@ -322,8 +330,12 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     # теперь для всех SKU, которых не нашлось в turnover/stocks, всегда идём в fallback.
     sku_strings = [str(s) for s in skus]
     try:
-        for i in range(0, len(sku_strings), 500):
-            batch = sku_strings[i:i+500]
+        for i in range(0, len(sku_strings), 1000):
+            if i > 0:
+                st.info("Ждём ~60 сек между запросами к /v1/analytics/turnover/stocks (лимит Ozon: 1 запрос/мин)…")
+                import time as _t
+                _t.sleep(61)
+            batch = sku_strings[i:i+1000]
             data = api_post("/v1/analytics/turnover/stocks",
                             {"sku": batch, "limit": len(batch), "offset": 0},
                             client_id, api_key)
