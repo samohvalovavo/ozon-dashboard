@@ -441,6 +441,8 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
             sku = str(prod.get("sku") or "")
             if not sku:
                 continue
+            # offer_id может приходить прямо из транзакционного API — используем его как артикул
+            offer_id_direct = str(prod.get("offer_id") or "")
 
             comm_block = prod.get("commission") or {}
             delivery_block = prod.get("delivery") or {}
@@ -473,7 +475,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
 
             rows.append({
                 "sku": sku,
-                "article": sku,
+                "article": offer_id_direct if offer_id_direct else sku,  # offer_id приоритетнее SKU
                 "name": "",
                 "qty": qty if is_sale else 0,
                 "qty_ret": qty if is_return else 0,
@@ -495,6 +497,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
             sku = str(sku_fees.get("sku") or "")
             if not sku:
                 continue
+            offer_id_fees = str(sku_fees.get("offer_id") or "")
             for fee in (sku_fees.get("fees") or []):
                 if not isinstance(fee, dict):
                     continue
@@ -502,7 +505,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
                 amount = float((fee.get("accrued") or {}).get("amount") or 0)
                 known = {ACQUIRING_TYPE_ID, INSTALLMENT_TYPE_ID} | PROMO_TYPE_IDS
                 rows.append({
-                    "sku": sku, "article": sku, "name": "",
+                    "sku": sku, "article": offer_id_fees if offer_id_fees else sku, "name": "",
                     "qty": 0, "qty_ret": 0, "sale": 0, "return": 0,
                     "commission": 0, "logistics": 0,
                     "acquiring":    amount if tid == ACQUIRING_TYPE_ID   else 0.0,
@@ -718,7 +721,15 @@ with st.sidebar:
                 cost_df = cost_df.dropna(subset=[art_col])
                 cost_df[art_col] = cost_df[art_col].astype(str).str.strip()
                 cost_df = cost_df[cost_df[art_col].str.len() > 0]
-                cost_df[cost_col] = pd.to_numeric(cost_df[cost_col], errors="coerce")
+                cost_df[cost_col] = (
+                    cost_df[cost_col]
+                    .astype(str)
+                    .str.replace('\xa0', '', regex=False)   # неразрывный пробел (1 043,00)
+                    .str.replace(' ', '', regex=False)  # тонкий пробел
+                    .str.replace(' ', '', regex=False)       # обычный пробел
+                    .str.replace(',', '.', regex=False)      # запятая → точка
+                    .pipe(pd.to_numeric, errors='coerce')
+                )
                 cost_map = dict(zip(cost_df[art_col], cost_df[cost_col].fillna(0)))
 
                 already = any(h["filename"] == cost_file.name and
@@ -936,6 +947,7 @@ if load_btn:
 
                     # enrich_with_cost вызывается ПОСЛЕ обновления логистики
                     st.session_state.df = enrich_with_cost(raw_df, cost_map)
+                    st.session_state._cost_map_debug = cost_map  # для диагностики в Tab5
                     st.session_state.is_demo = False
                     st.session_state.loaded_period = (d_from, d_to)
                     with st.spinner("Загружаем остатки и оборачиваемость..."):
@@ -1593,6 +1605,40 @@ with tab5:
             st.caption("Если Реклама и Эквайринг = 0 — item_fees не дошли до таблицы (нужно проверить сопоставление SKU). Если > 0 — данные есть и отображаются в колонках.")
         else:
             st.warning("df ещё не загружен — сначала нажмите «Загрузить данные»")
+
+        # 6. Себестоимость: диагностика cost_map ↔ df["article"]
+        st.subheader("Себестоимость: диагностика")
+        _cm_debug = st.session_state.get("_cost_map_debug", {})
+        _fdf_cost = st.session_state.get("df")
+        _dc1, _dc2, _dc3 = st.columns(3)
+        _dc1.metric("Записей в cost_map (XLSX)", str(len(_cm_debug)))
+        _dc2.metric("Записей в sku_map_cache", str(len(sku_map_cache)))
+        if _fdf_cost is not None and not _fdf_cost.empty:
+            _articles_list = _fdf_cost["article"].tolist()
+            _matches_count = sum(1 for a in _articles_list if a in _cm_debug)
+            _dc3.metric("Совпадений article↔cost_map", str(_matches_count))
+            if _cm_debug:
+                st.caption("Первые 5 ключей cost_map (из XLSX):")
+                st.code(str(list(_cm_debug.keys())[:5]))
+            st.caption("Первые 5 значений df['article'] (из API):")
+            st.code(str(_articles_list[:5]))
+            if _matches_count == 0 and _cm_debug:
+                st.error("❌ Нет совпадений: артикулы в XLSX не совпадают с df['article']. "
+                         "Если df['article'] — числа, значит sku_map пуст и SKU не были сопоставлены с offer_id.")
+        else:
+            _dc3.metric("Совпадений article↔cost_map", "—")
+
+        # 7. Справочник типов начислений: сырой ответ
+        st.subheader("Справочник типов начислений (raw API)")
+        if client_id and api_key:
+            with st.spinner("Запрос /v1/finance/accrual/types..."):
+                _raw_accrual_types = api_post("/v1/finance/accrual/types", {}, client_id, api_key)
+            if _raw_accrual_types:
+                st.json(_raw_accrual_types)
+            else:
+                st.warning("Пустой ответ от /v1/finance/accrual/types")
+        else:
+            st.info("Введи API-ключи чтобы увидеть справочник типов")
 
     # Обратный справочник: offer_id → список numeric SKU
     reverse_map: dict[str, list[str]] = {}
