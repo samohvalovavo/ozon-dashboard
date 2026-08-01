@@ -1672,6 +1672,25 @@ with tab5:
         )
         st.json(_sample, expanded=2)
 
+        # 4b. Поиск конкретного начисления по ID — чтобы найти поле "Баллы за скидки" /
+        # "Программы партнёров" (эти суммы есть в выгрузке XLSX, но НЕ парсятся сейчас в коде —
+        # в transactions_to_df() читается только commission.sale_amount / sale_commission / seller_price).
+        st.subheader("Найти начисление по ID (для поиска поля 'Баллы за скидки' / 'Программы партнёров')")
+        st.caption(
+            "По умолчанию — заказ 44329526-0299-1: в выгрузке 'Отчёт по начислениям.xlsx' у него "
+            "Выручка=1198.10, Программы партнёров=11.98, Баллы за скидки=1248.92. "
+            "Разверни posting → products → [0] → commission и найди ключи с такими суммами."
+        )
+        _search_id = st.text_input("ID начисления / unit_number", value="44329526-0299-1")
+        if _search_id:
+            _matches = [a for a in raw_ops if str(a.get("unit_number", "")) == _search_id.strip()]
+            if _matches:
+                st.write(f"Найдено начислений: {len(_matches)}")
+                for _m in _matches:
+                    st.json(_m, expanded=4)
+            else:
+                st.warning("Начисление с таким ID не найдено в загруженном периоде.")
+
         # 5. Итоговые суммы в финальном df (после enrich_with_cost)
         st.subheader("Итоги в финальном df (после enrich_with_cost)")
         _fdf = st.session_state.get("df")
