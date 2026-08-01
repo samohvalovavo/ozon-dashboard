@@ -761,6 +761,11 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict) -> pd.DataFrame:
         - df["tax"]
     )
     df["margin_pct"] = (df["profit"] / df["total_income"].replace(0, float("nan"))) * 100
+
+    # По запросу пользователя (02.08.2026): "Выручка" в интерфейсе должна быть ПОЛНОЙ, с баллами
+    # за скидки и программами партнёров. tax и profit выше уже посчитаны на правильной базе
+    # (revenue+partner_programs — без баллов), так что просто переопределяем колонку ПОСЛЕ расчётов.
+    df["revenue"] = df["total_income"]
     return df
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
@@ -1127,10 +1132,12 @@ comm_pct = (total_comm / total_rev * 100) if total_rev else 0
 log_pct  = (total_log  / total_rev * 100) if total_rev else 0
 cost_pct = (total_cost / total_rev * 100) if total_rev else 0
 
+total_tax = df["tax"].sum() if "tax" in df.columns else 0.0
+
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("Выручка", r(total_rev), f"{total_rev/days:,.0f} ₽/день".replace(",", " "))
 if total_partner or total_bonus:
-    c1.caption(f"+ Программы {r(total_partner)} + Баллы {r(total_bonus)} = Доход {r(total_income)}")
+    c1.caption(f"из них: Программы {r(total_partner)}, Баллы {r(total_bonus)}")
 c2.metric("Реальная прибыль", r(total_prof_adj), f"{total_prof_adj/days:,.0f} ₽/день".replace(",", " "),
           delta_color="normal" if total_prof_adj >= 0 else "inverse")
 c3.metric("Маржа", ru_pct(total_margin), delta_color="normal" if total_margin >= 5 else "inverse")
@@ -1147,11 +1154,16 @@ with c7:
 
 # ── Расходы магазина (non_item_fee) ─────────────────────────────────────────
 store_costs: dict = _sc_kpi   # уже загружено выше для KPI
-if store_costs:
+if store_costs or total_tax:
     store_total = _sc_total_kpi   # уже вычислено выше
     # total_prof_adj уже вычислен выше
 
-    with st.expander(f"🏪 Расходы магазина: {r(abs(store_total))} (не входят в таблицу по артикулам)", expanded=False):
+    with st.expander(
+        f"🏪 Расходы магазина: {r(abs(store_total))} + Налог {r(total_tax)} "
+        f"(налог не входит в таблицу по артикулам отдельной строкой расхода магазина — "
+        f"он уже вычтен из «Прибыли по артикулам»; показан здесь просто для сводки)",
+        expanded=False,
+    ):
         sc_rows = []
         for tid, amt in sorted(store_costs.items(), key=lambda x: x[1]):
             if amt == 0:
@@ -1160,6 +1172,13 @@ if store_costs:
                 "Статья": TYPE_NAMES.get(tid, f"type_{tid}"),
                 "Группа": STORE_COST_GROUPS.get(tid, "Прочее"),
                 "Сумма": amt,
+            })
+        # Налог УСН — отдельной строкой в этой же сводке (по запросу пользователя, 02.08.2026).
+        if total_tax:
+            sc_rows.append({
+                "Статья": "Налог УСН 7% (Выручка + Программы партнёров)",
+                "Группа": "Налоги",
+                "Сумма": -abs(total_tax),
             })
         if sc_rows:
             sc_df = pd.DataFrame(sc_rows)
@@ -1175,10 +1194,11 @@ if store_costs:
                     sc_df.style.format({"Сумма": lambda v: ru_float(v, 2)}),
                     use_container_width=True, hide_index=True,
                 )
-        sa1, sa2, sa3 = st.columns(3)
+        sa1, sa2, sa3, sa4 = st.columns(4)
         sa1.metric("Прибыль по артикулам", r(total_prof))
         sa2.metric("Расходы магазина", r(abs(store_total)))
-        sa3.metric("Реальная прибыль", r(total_prof_adj),
+        sa3.metric("Налог (справочно)", r(total_tax))
+        sa4.metric("Реальная прибыль", r(total_prof_adj),
                    delta_color="normal" if total_prof_adj >= 0 else "inverse")
 
 st.divider()
@@ -1252,7 +1272,7 @@ with tab1:
     ci1, ci2, ci3, ci4 = st.columns(4)
     ci1.metric("Выручка", r(total_rev))
     if total_partner or total_bonus:
-        ci1.caption(f"Доход с баллами и партнёркой: {r(total_income)}")
+        ci1.caption(f"из них: Программы {r(total_partner)}, Баллы {r(total_bonus)}")
     ci2.metric("Прибыль", r(total_prof))
     ci3.metric("Маржа", ru_pct(total_margin))
     ci4.metric("Расходы (комиссия + логистика)", r(total_comm + total_log))
