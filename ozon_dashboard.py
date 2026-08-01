@@ -205,11 +205,11 @@ def api_post(endpoint: str, body: dict, client_id: str, api_key: str, _retries: 
                 _time.sleep(delay)
                 delay *= 2
                 continue
-            st.error(f"Ошибка API 429: превышен лимит запросов в секунду, повторные попытки не помогли ({r.text[:200]})")
+            st.error(f"Ошибка API 429 на {endpoint}: лимит запросов исчерпан, повторные попытки не помогли ({r.text[:200]})")
             return {}
 
         if r.status_code != 200:
-            st.error(f"Ошибка API {r.status_code}: {r.text[:300]}")
+            st.error(f"Ошибка API {r.status_code} на {endpoint}: {r.text[:300]}")
             return {}
 
         return r.json()
@@ -247,10 +247,12 @@ def fetch_transactions(client_id: str, api_key: str, date_from: str, date_to: st
     total_days = (to_dt - from_dt).days + 1
     day_count = 0
 
+    import time as _time
+
     while cur <= to_dt:
         day_str = cur.strftime("%Y-%m-%d")
         last_id = ""
-        
+
         while True:
             try:
                 data = api_post(
@@ -258,29 +260,36 @@ def fetch_transactions(client_id: str, api_key: str, date_from: str, date_to: st
                     {"date": day_str, "last_id": last_id},
                     client_id, api_key,
                 )
-                
+
                 if not data:
                     break
-                    
+
                 accruals = data.get("accruals") or []
                 if accruals:
                     for a in accruals:
                         if isinstance(a, dict):
                             a["_date"] = day_str
                     all_accruals.extend(accruals)
-                
+
                 last_id = data.get("last_id") or ""
                 if not last_id or not accruals:
                     break
-                    
+
+                # ВАЖНО (найдено 02.08.2026): если за день несколько страниц (last_id),
+                # раньше эти запросы шли подряд БЕЗ паузы — пауза 0.15с стояла только между
+                # днями, а не между страницами внутри дня. При большом объёме заказов в день
+                # это и было источником 429. Пауза нужна перед КАЖДЫМ запросом, включая
+                # продолжение пагинации.
+                _time.sleep(0.15)
+
             except Exception as e:
                 st.warning(f"Ошибка при загрузке дня {day_str}: {e}")
                 break
-                
+
         cur += timedelta(days=1)
         day_count += 1
         progress_bar.progress(min(day_count / total_days, 1.0))
-        import time; time.sleep(0.15)  # пауза между днями — избегаем 429
+        _time.sleep(0.15)  # пауза между днями — избегаем 429
 
     progress_bar.empty()
     return all_accruals
