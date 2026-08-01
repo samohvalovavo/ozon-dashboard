@@ -87,7 +87,7 @@ _ACCRUAL_EN_TO_RU: dict[str, str] = {
     "PayPerClick":                  "Оплата за клик",
     "AcceleratedReviewCollection":  "Ускоренный сбор отзывов",
     "ItemCompensation":             "Компенсация за товар",
-    "Placements":                   "Размещение рекламы",
+    "Placements":                   "Размещение на складе (платное хранение)",
     "DefectFineErrors":             "Штраф (ошибки)",
     "DefectFineShipmentDelayRate":  "Штраф (задержка отгрузки)",
     "StorageFee":                   "Хранение на складе",
@@ -311,6 +311,27 @@ def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
             result[int(tid)] = _ACCRUAL_EN_TO_RU.get(name, name)
     return result
 
+# Модульный (процесс-wide) таймер последнего запроса к /v1/analytics/turnover/stocks.
+# ВАЖНО: лимит 1 запрос/мин — на весь Client-Id, а не на один вызов fetch_offer_ids_by_sku().
+# Если пользователь грузит один период, а следом сразу другой (например, август → июль),
+# это ДВА РАЗНЫХ вызова функции (разные наборы SKU → разные ключи кэша st.cache_data),
+# и без общего таймера второй вызов ловит 429, даже если каждый по отдельности шлёт всего
+# один запрос. Список используется вместо простой переменной, чтобы значение переживало
+# переопределения модуля при hot-reload в Streamlit.
+_turnover_stocks_last_call_ts = [0.0]
+
+def _wait_turnover_stocks_cooldown():
+    import time as _t
+    elapsed = _t.time() - _turnover_stocks_last_call_ts[0]
+    remaining = 61 - elapsed
+    if remaining > 0:
+        st.info(
+            f"Ждём {remaining:.0f} сек — у /v1/analytics/turnover/stocks лимит 1 запрос/мин "
+            f"на аккаунт (недавно уже был запрос, возможно из другой загрузки/периода)…"
+        )
+        _t.sleep(remaining)
+    _turnover_stocks_last_call_ts[0] = _t.time()
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     """
@@ -340,11 +361,8 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     sku_strings = [str(s) for s in skus]
     try:
         for i in range(0, len(sku_strings), 1000):
-            if i > 0:
-                st.info("Ждём ~60 сек между запросами к /v1/analytics/turnover/stocks (лимит Ozon: 1 запрос/мин)…")
-                import time as _t
-                _t.sleep(61)
             batch = sku_strings[i:i+1000]
+            _wait_turnover_stocks_cooldown()  # ждёт, если нужно, ПЕРЕД КАЖДЫМ запросом к этому методу
             data = api_post("/v1/analytics/turnover/stocks",
                             {"sku": batch, "limit": len(batch), "offset": 0},
                             client_id, api_key)
