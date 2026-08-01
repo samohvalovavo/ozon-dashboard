@@ -250,7 +250,7 @@ def fetch_sku_map(client_id: str, api_key: str) -> dict:
     since = (today - timedelta(days=90)).strftime("%Y-%m-%d")
     to    = today.strftime("%Y-%m-%d")
 
-    for schema, path in [("fbo", "/v2/posting/fbo/list"), ("fbs", "/v3/posting/fbs/list")]:
+    for schema, path in [("fbo", "/v3/posting/fbo/list"), ("fbs", "/v4/posting/fbs/list")]:
         try:
             offset = 0
             while True:
@@ -264,10 +264,10 @@ def fetch_sku_map(client_id: str, api_key: str) -> dict:
                     "with": {"financial_data": False, "analytics_data": False}
                 }
                 resp = api_post(path, body, client_id, api_key)
-                
+
                 if not resp:
                     break
-                
+
                 if schema == "fbo":
                     result = resp.get("result", {})
                     postings = result if isinstance(result, list) else result.get("postings", [])
@@ -351,7 +351,7 @@ def fetch_name_map(client_id: str, api_key: str) -> dict:
     since = (today - timedelta(days=90)).strftime("%Y-%m-%d")
     to    = today.strftime("%Y-%m-%d")
     
-    for schema, path in [("fbo", "/v2/posting/fbo/list"), ("fbs", "/v3/posting/fbs/list")]:
+    for schema, path in [("fbo", "/v3/posting/fbo/list"), ("fbs", "/v4/posting/fbs/list")]:
         try:
             offset = 0
             while True:
@@ -618,15 +618,20 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict) -> pd.DataFrame:
     else:
         df["acquiring"] = df["acquiring"].abs()  # приводим к положительному для отображения расхода
     df["tax"] = TAX * df["revenue"]
-    for col in ("promo", "installment", "other_costs"):
-        if col not in df.columns:
+    # promo и installment приводим к положительному (расход), как acquiring
+    for col in ("promo", "installment"):
+        if col in df.columns:
+            df[col] = df[col].abs()
+        else:
             df[col] = 0.0
+    if "other_costs" not in df.columns:
+        df["other_costs"] = 0.0
     df["profit"] = (
         df["revenue"]
         + df["commission"]     # отрицательная
         + df["logistics"]      # отрицательная
-        + df["promo"]          # отрицательная
-        + df["installment"]    # отрицательная
+        - df["promo"]          # положительная (расход) — после abs()
+        - df["installment"]    # положительная (расход) — после abs()
         + df["other_costs"]    # прочие (могут быть ± )
         - df["cost_total"]
         - df["acquiring"]
@@ -865,19 +870,16 @@ if load_btn:
                         name_map = fetch_name_map(client_id, api_key)
                         raw_df = apply_sku_map(raw_df, sku_map, name_map)
                         st.caption(f"Справочник: {len(sku_map)} товаров, {len(name_map) if name_map else 0} названий")
-                    st.session_state.df = enrich_with_cost(raw_df, cost_map)
-                    st.session_state.is_demo = False
-                    st.session_state.loaded_period = (d_from, d_to)
-                    with st.spinner("Загружаем остатки и оборачиваемость..."):
-                        skus_tuple = tuple(sorted(sku_map.keys())) if sku_map else ()
-                        st.session_state.stocks_data = fetch_stocks(client_id, api_key, skus_tuple)
+
                     if use_transactions:
+                        # Транзакционный режим — логистика уже в raw_df
                         st.session_state.raw_ops = ops
                         st.session_state.sku_map_cache = sku_map if sku_map else {}
                         st.session_state.store_costs = collect_store_costs(ops)
                     else:
-                        # Реализация: подтягиваем транзакции только для расходов магазина (non_item_fee)
-                        with st.spinner("Загружаем расходы магазина за период..."):
+                        # Реализация: транзакции для логистики + расходов магазина
+                        # Запрашиваем ДО enrich_with_cost, чтобы логистика попала в расчёт прибыли
+                        with st.spinner("Загружаем логистику и расходы магазина..."):
                             try:
                                 ops_for_costs = fetch_transactions(
                                     client_id, api_key,
@@ -885,8 +887,37 @@ if load_btn:
                                     d_to.strftime("%Y-%m-%d"),
                                 )
                                 st.session_state.store_costs = collect_store_costs(ops_for_costs)
+                                st.session_state.raw_ops = ops_for_costs
+                                st.session_state.sku_map_cache = sku_map if sku_map else {}
+
+                                # Суммируем логистику по артикулам из транзакций
+                                _logi: dict[str, float] = {}
+                                for _a in ops_for_costs:
+                                    _p = _a.get("posting") or {}
+                                    for _pr in (_p.get("products") or []):
+                                        if not isinstance(_pr, dict):
+                                            continue
+                                        _sku = str(_pr.get("sku") or "")
+                                        if not _sku:
+                                            continue
+                                        _oid = (sku_map or {}).get(_sku, _sku)
+                                        _d = _pr.get("delivery") or {}
+                                        _v = float(((_d.get("total_accrued") or {}).get("amount") or 0))
+                                        if _v:
+                                            _logi[_oid] = _logi.get(_oid, 0.0) + _v
+                                # Обновляем logistics в raw_df ДО enrich_with_cost
+                                if _logi:
+                                    raw_df["logistics"] = raw_df["article"].map(_logi).fillna(0.0)
                             except Exception:
                                 pass  # расходы магазина необязательны
+
+                    # enrich_with_cost вызывается ПОСЛЕ обновления логистики
+                    st.session_state.df = enrich_with_cost(raw_df, cost_map)
+                    st.session_state.is_demo = False
+                    st.session_state.loaded_period = (d_from, d_to)
+                    with st.spinner("Загружаем остатки и оборачиваемость..."):
+                        skus_tuple = tuple(sorted(sku_map.keys())) if sku_map else ()
+                        st.session_state.stocks_data = fetch_stocks(client_id, api_key, skus_tuple)
             except Exception as e:
                 st.error(f"Ошибка загрузки: {e}")
 
@@ -931,7 +962,12 @@ total_comm = df["commission"].abs().sum()
 total_log  = df["logistics"].abs().sum() if "logistics" in df.columns else 0
 total_cost = df["cost_total"].sum() if "cost_total" in df.columns else 0
 total_qty  = df["qty"].sum()
-total_margin = (total_prof / total_rev * 100) if total_rev else 0
+
+# Расходы магазина нужны ДО метрик — чтобы показать реальную прибыль и правильную маржу
+_sc_kpi: dict = st.session_state.get("store_costs", {})
+_sc_total_kpi = sum(v for v in _sc_kpi.values() if v < 0) if _sc_kpi else 0
+total_prof_adj = total_prof + _sc_total_kpi   # реальная прибыль = прибыль по артикулам − расходы магазина
+total_margin = (total_prof_adj / total_rev * 100) if total_rev else 0
 
 comm_pct = (total_comm / total_rev * 100) if total_rev else 0
 log_pct  = (total_log  / total_rev * 100) if total_rev else 0
@@ -939,8 +975,8 @@ cost_pct = (total_cost / total_rev * 100) if total_rev else 0
 
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("Выручка", r(total_rev), f"{total_rev/days:,.0f} ₽/день".replace(",", " "))
-c2.metric("Прибыль", r(total_prof), f"{total_prof/days:,.0f} ₽/день".replace(",", " "),
-          delta_color="normal" if total_prof >= 0 else "inverse")
+c2.metric("Реальная прибыль", r(total_prof_adj), f"{total_prof_adj/days:,.0f} ₽/день".replace(",", " "),
+          delta_color="normal" if total_prof_adj >= 0 else "inverse")
 c3.metric("Маржа", ru_pct(total_margin), delta_color="normal" if total_margin >= 5 else "inverse")
 c4.metric("Продано", f"{int(total_qty)} шт", f"{total_qty/days:.1f}".replace(".", ",") + " шт/день")
 with c5:
@@ -954,10 +990,10 @@ with c7:
     st.caption(f"({ru_pct(log_pct)} от выручки)")
 
 # ── Расходы магазина (non_item_fee) ─────────────────────────────────────────
-store_costs: dict = st.session_state.get("store_costs", {})
+store_costs: dict = _sc_kpi   # уже загружено выше для KPI
 if store_costs:
-    store_total = sum(v for v in store_costs.values() if v < 0)
-    total_prof_adj = total_prof + store_total   # реальная прибыль с учётом расходов магазина
+    store_total = _sc_total_kpi   # уже вычислено выше
+    # total_prof_adj уже вычислен выше
 
     with st.expander(f"🏪 Расходы магазина: {r(abs(store_total))} (не входят в таблицу по артикулам)", expanded=False):
         sc_rows = []
@@ -1052,11 +1088,19 @@ with tab1:
 
     # Итого
     st.markdown("**Итого по всем артикулам:**")
+    _total_promo = df["promo"].abs().sum() if "promo" in df.columns else 0
+    _total_acq   = df["acquiring"].abs().sum() if "acquiring" in df.columns else 0
+    _total_inst  = df["installment"].abs().sum() if "installment" in df.columns else 0
     ci1, ci2, ci3, ci4 = st.columns(4)
     ci1.metric("Выручка", r(total_rev))
     ci2.metric("Прибыль", r(total_prof))
     ci3.metric("Маржа", ru_pct(total_margin))
-    ci4.metric("Расходы", r(total_comm + total_log))
+    ci4.metric("Расходы (комиссия + логистика)", r(total_comm + total_log))
+    ci5, ci6, ci7, ci8 = st.columns(4)
+    ci5.metric("Реклама (per-артикул)", r(_total_promo))
+    ci6.metric("Эквайринг (per-артикул)", r(_total_acq))
+    ci7.metric("Рассрочка (per-артикул)", r(_total_inst))
+    ci8.metric("Налог (расчётный)", r(df["tax"].sum() if "tax" in df.columns else 0))
 
     # Скачать Excel (форматированный — для просмотра)
     @st.cache_data
@@ -1443,15 +1487,89 @@ with tab5:
         st.stop()
 
     # ── Диагностика структуры API ──────────────────────────────────────────────
-    with st.expander("🔧 Диагностика API (структура одного начисления)", expanded=False):
+    with st.expander("🔧 Диагностика API", expanded=False):
         import json
-        # Ищем начисление с posting (продажа/возврат) для наглядности
-        sample = next(
+
+        # 1. Категории начислений и их количество
+        cat_counts: dict[str, int] = {}
+        cat_has_item_fees: dict[str, int] = {}
+        for _a in raw_ops:
+            _cat = _a.get("accrued_category", "UNKNOWN")
+            cat_counts[_cat] = cat_counts.get(_cat, 0) + 1
+            _ifs = _a.get("item_fees")
+            if _ifs and isinstance(_ifs, dict) and (_ifs.get("fees") or []):
+                cat_has_item_fees[_cat] = cat_has_item_fees.get(_cat, 0) + 1
+
+        st.subheader("Категории начислений")
+        _cat_rows = [{"Категория": k, "Кол-во": v,
+                      "С item_fees": cat_has_item_fees.get(k, 0)} for k, v in sorted(cat_counts.items())]
+        st.dataframe(pd.DataFrame(_cat_rows), hide_index=True, use_container_width=True)
+
+        # 2. Логистика: сопоставленная vs несопоставленная (numeric SKU без offer_id)
+        st.subheader("Логистика: сопоставлено / несопоставлено")
+        _logi_matched = 0.0
+        _logi_unmatched = 0.0
+        _unmatched_skus: dict[str, float] = {}
+        for _a in raw_ops:
+            _p = _a.get("posting") or {}
+            for _pr in (_p.get("products") or []):
+                if not isinstance(_pr, dict): continue
+                _sku = str(_pr.get("sku") or "")
+                _v = float((((_pr.get("delivery") or {}).get("total_accrued") or {}).get("amount") or 0))
+                if not _v: continue
+                if sku_map_cache.get(_sku):
+                    _logi_matched += _v
+                else:
+                    _logi_unmatched += _v
+                    _unmatched_skus[_sku] = _unmatched_skus.get(_sku, 0.0) + _v
+        st.metric("Сопоставлено (есть offer_id)", f"{abs(_logi_matched):,.0f} ₽")
+        st.metric("Несопоставлено (нет в справочнике)", f"{abs(_logi_unmatched):,.0f} ₽")
+        if _unmatched_skus:
+            st.caption("Несопоставленные SKU:")
+            st.dataframe(pd.DataFrame([{"SKU": k, "Логистика": v}
+                                        for k, v in _unmatched_skus.items()]),
+                         hide_index=True, use_container_width=True)
+
+        # 3. item_fees: тип начисления и суммы
+        st.subheader("Суммы по item_fees (type_id / accrual_id)")
+        _fee_totals: dict[int, float] = {}
+        for _a in raw_ops:
+            _ifs = _a.get("item_fees") or {}
+            for _sf in (_ifs.get("fees") or []):
+                if not isinstance(_sf, dict): continue
+                for _f in (_sf.get("fees") or []):
+                    if not isinstance(_f, dict): continue
+                    _tid = _get_type_id(_f)
+                    _amt = float(((_f.get("accrued") or {}).get("amount") or 0))
+                    if _amt: _fee_totals[_tid] = _fee_totals.get(_tid, 0.0) + _amt
+        if _fee_totals:
+            st.dataframe(pd.DataFrame([
+                {"type_id": k, "Название": TYPE_NAMES.get(k, "⚠️ Неизвестно"), "Сумма": v}
+                for k, v in sorted(_fee_totals.items(), key=lambda x: x[1])
+            ]), hide_index=True, use_container_width=True)
+        else:
+            st.info("item_fees пусты для всех начислений в этом периоде")
+
+        # 4. Сырой пример POSTING-начисления
+        st.subheader("Пример POSTING (products)")
+        _sample = next(
             (a for a in raw_ops if a.get("posting") and (a["posting"].get("products") or [])),
             raw_ops[0] if raw_ops else {}
         )
-        st.caption("Первое начисление типа POSTING из API — проверь наличие `delivery.total_accrued`:")
-        st.json(sample, expanded=2)
+        st.json(_sample, expanded=2)
+
+        # 5. Итоговые суммы в финальном df (после enrich_with_cost)
+        st.subheader("Итоги в финальном df (после enrich_with_cost)")
+        _fdf = st.session_state.get("df")
+        if _fdf is not None and not _fdf.empty:
+            _d5c1, _d5c2, _d5c3, _d5c4 = st.columns(4)
+            _d5c1.metric("Реклама (promo) — сумма", f"{_fdf['promo'].abs().sum():,.0f} ₽".replace(",", " ") if "promo" in _fdf.columns else "нет колонки")
+            _d5c2.metric("Эквайринг (acquiring) — сумма", f"{_fdf['acquiring'].abs().sum():,.0f} ₽".replace(",", " ") if "acquiring" in _fdf.columns else "нет колонки")
+            _d5c3.metric("Рассрочка (installment) — сумма", f"{_fdf['installment'].abs().sum():,.0f} ₽".replace(",", " ") if "installment" in _fdf.columns else "нет колонки")
+            _d5c4.metric("Логистика (logistics) — сумма", f"{_fdf['logistics'].abs().sum():,.0f} ₽".replace(",", " ") if "logistics" in _fdf.columns else "нет колонки")
+            st.caption("Если Реклама и Эквайринг = 0 — item_fees не дошли до таблицы (нужно проверить сопоставление SKU). Если > 0 — данные есть и отображаются в колонках.")
+        else:
+            st.warning("df ещё не загружен — сначала нажмите «Загрузить данные»")
 
     # Обратный справочник: offer_id → список numeric SKU
     reverse_map: dict[str, list[str]] = {}
