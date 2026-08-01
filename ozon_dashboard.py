@@ -515,13 +515,24 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
             comm_block = prod.get("commission") or {}
             delivery_block = prod.get("delivery") or {}
 
-            # Выручка (цена продавца * кол-во)
-            sale_amount_block = (comm_block.get("sale_amount") or {}) if isinstance(comm_block, dict) else {}
-            revenue_val = float((sale_amount_block.get("amount") or 0) if isinstance(sale_amount_block, dict) else 0)
+            def _amt(block: dict, key: str) -> float:
+                sub = (block.get(key) or {}) if isinstance(block, dict) else {}
+                return float((sub.get("amount") or 0) if isinstance(sub, dict) else 0)
+
+            # sale_amount / seller_price — ПОЛНАЯ сумма заказа (Выручка + Программы партнёров + Баллы за скидки).
+            # Используем ТОЛЬКО для расчёта qty (кол-во единиц в мультизаказе), это НЕ выручка.
+            gross_val = _amt(comm_block, "sale_amount")
+            seller_price_val = _amt(comm_block, "seller_price")
+
+            # Настоящая Выручка (совпадает со столбцом "Выручка" в выгрузке Ozon "Отчёт по начислениям")
+            revenue_val = _amt(comm_block, "sale_price")
+            # Программы партнёров
+            partner_val = _amt(comm_block, "coinvestment")
+            # Баллы за скидки — реальные деньги от Ozon, но не облагаются налогом (по решению пользователя)
+            bonus_val = _amt(comm_block, "bonus")
 
             # Комиссия Ozon
-            sale_comm = (comm_block.get("sale_commission") or {}) if isinstance(comm_block, dict) else {}
-            commission_val = float((sale_comm.get("amount") or 0) if isinstance(sale_comm, dict) else 0)
+            commission_val = _amt(comm_block, "sale_commission")
 
             # Логистика = весь total_accrued (включает FBO + доставку партнёрами type_29 и др.)
             logi_block = (delivery_block.get("total_accrued") or {}) if isinstance(delivery_block, dict) else {}
@@ -530,16 +541,14 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
             # Эквайринг — приходит через ITEM-начисления (item_fees), не из delivery.services
             acquiring_val = 0.0
 
-            # Количество: sale_amount / seller_price (для мультизаказов)
-            seller_price_block = (comm_block.get("seller_price") or {}) if isinstance(comm_block, dict) else {}
-            seller_price_val = float((seller_price_block.get("amount") or 0) if isinstance(seller_price_block, dict) else 0)
-            if seller_price_val > 0 and abs(revenue_val) > 0:
-                qty = max(1, round(abs(revenue_val) / seller_price_val))
+            # Количество: gross (sale_amount) / seller_price (для мультизаказов)
+            if seller_price_val > 0 and abs(gross_val) > 0:
+                qty = max(1, round(abs(gross_val) / seller_price_val))
             else:
                 qty = 1
 
-            is_return = revenue_val < 0
-            is_sale = not is_return and revenue_val != 0
+            is_return = gross_val < 0
+            is_sale = not is_return and gross_val != 0
 
             rows.append({
                 "sku": sku,
@@ -549,6 +558,8 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
                 "qty_ret": qty if is_return else 0,
                 "sale": revenue_val if is_sale else 0,
                 "return": revenue_val if is_return else 0,
+                "partner_programs": partner_val,
+                "bonus_points": bonus_val,
                 "commission": commission_val,
                 "logistics": logistics_val,
                 "acquiring":   acquiring_val,
@@ -575,6 +586,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
                 rows.append({
                     "sku": sku, "article": offer_id_fees if offer_id_fees else sku, "name": "",
                     "qty": 0, "qty_ret": 0, "sale": 0, "return": 0,
+                    "partner_programs": 0.0, "bonus_points": 0.0,
                     "commission": 0, "logistics": 0,
                     "acquiring":    amount if tid == ACQUIRING_TYPE_ID   else 0.0,
                     "promo":        amount if tid in PROMO_TYPE_IDS       else 0.0,
@@ -586,7 +598,8 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    for col in ["qty", "qty_ret", "sale", "return", "commission", "logistics", "acquiring", "promo", "installment", "other_costs"]:
+    for col in ["qty", "qty_ret", "sale", "return", "partner_programs", "bonus_points",
+                "commission", "logistics", "acquiring", "promo", "installment", "other_costs"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     grouped = df.groupby(["sku", "article"]).agg(
@@ -595,6 +608,8 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
         qty_ret=("qty_ret", "sum"),
         sale=("sale", "sum"),
         return_sum=("return", "sum"),
+        partner_programs=("partner_programs", "sum"),
+        bonus_points=("bonus_points", "sum"),
         commission=("commission", "sum"),
         logistics=("logistics", "sum"),
         acquiring=("acquiring", "sum"),
@@ -705,7 +720,22 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict) -> pd.DataFrame:
         df["acquiring"] = ACQUIRING * df["revenue"]
     else:
         df["acquiring"] = df["acquiring"].abs()  # приводим к положительному для отображения расхода
-    df["tax"] = TAX * df["revenue"]
+
+    # Программы партнёров и Баллы за скидки — из транзакционного API (посылка commission.coinvestment /
+    # commission.bonus). Для отчёта о реализации (realization_to_df) этих колонок нет — считаем их нулевыми.
+    if "partner_programs" not in df.columns:
+        df["partner_programs"] = 0.0
+    if "bonus_points" not in df.columns:
+        df["bonus_points"] = 0.0
+
+    # Налог УСН 7%: база = Выручка + Программы партнёров. Баллы за скидки в базу НЕ входят
+    # (решение пользователя, 02.08.2026) — см. OZON_DASHBOARD_CONTEXT.md.
+    df["tax"] = TAX * (df["revenue"] + df["partner_programs"])
+
+    # Полный доход = Выручка + Программы партнёров + Баллы за скидки (реальные деньги,
+    # которые платит Ozon и которые сходятся с "Итого к выплате" в кабинете Ozon).
+    df["total_income"] = df["revenue"] + df["partner_programs"] + df["bonus_points"]
+
     # promo и installment приводим к положительному (расход), как acquiring
     for col in ("promo", "installment"):
         if col in df.columns:
@@ -715,7 +745,7 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict) -> pd.DataFrame:
     if "other_costs" not in df.columns:
         df["other_costs"] = 0.0
     df["profit"] = (
-        df["revenue"]
+        df["total_income"]
         + df["commission"]     # отрицательная
         + df["logistics"]      # отрицательная
         - df["promo"]          # положительная (расход) — после abs()
@@ -725,7 +755,7 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict) -> pd.DataFrame:
         - df["acquiring"]
         - df["tax"]
     )
-    df["margin_pct"] = (df["profit"] / df["revenue"].replace(0, float("nan"))) * 100
+    df["margin_pct"] = (df["profit"] / df["total_income"].replace(0, float("nan"))) * 100
     return df
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
@@ -1071,6 +1101,9 @@ else:
 
 # ── KPI ───────────────────────────────────────────────────────────────────────
 total_rev  = df["revenue"].sum()
+total_partner = df["partner_programs"].sum() if "partner_programs" in df.columns else 0.0
+total_bonus    = df["bonus_points"].sum() if "bonus_points" in df.columns else 0.0
+total_income   = df["total_income"].sum() if "total_income" in df.columns else total_rev
 total_prof = df["profit"].sum()
 total_comm = df["commission"].abs().sum()
 total_log  = df["logistics"].abs().sum() if "logistics" in df.columns else 0
@@ -1081,7 +1114,9 @@ total_qty  = df["qty"].sum()
 _sc_kpi: dict = st.session_state.get("store_costs", {})
 _sc_total_kpi = sum(v for v in _sc_kpi.values() if v < 0) if _sc_kpi else 0
 total_prof_adj = total_prof + _sc_total_kpi   # реальная прибыль = прибыль по артикулам − расходы магазина
-total_margin = (total_prof_adj / total_rev * 100) if total_rev else 0
+# Маржа считается от полного дохода (Выручка + Программы партнёров + Баллы за скидки) —
+# это соответствует построчному margin_pct в enrich_with_cost().
+total_margin = (total_prof_adj / total_income * 100) if total_income else 0
 
 comm_pct = (total_comm / total_rev * 100) if total_rev else 0
 log_pct  = (total_log  / total_rev * 100) if total_rev else 0
@@ -1089,6 +1124,8 @@ cost_pct = (total_cost / total_rev * 100) if total_rev else 0
 
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("Выручка", r(total_rev), f"{total_rev/days:,.0f} ₽/день".replace(",", " "))
+if total_partner or total_bonus:
+    c1.caption(f"+ Программы {r(total_partner)} + Баллы {r(total_bonus)} = Доход {r(total_income)}")
 c2.metric("Реальная прибыль", r(total_prof_adj), f"{total_prof_adj/days:,.0f} ₽/день".replace(",", " "),
           delta_color="normal" if total_prof_adj >= 0 else "inverse")
 c3.metric("Маржа", ru_pct(total_margin), delta_color="normal" if total_margin >= 5 else "inverse")
@@ -1145,7 +1182,7 @@ st.divider()
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 По артикулам", "📦 Остатки", "📈 Диаграммы", "🔢 Калькулятор", "🔍 Детализация"])
 
 with tab1:
-    show_cols = ["article", "name", "qty", "revenue", "cost_total",
+    show_cols = ["article", "name", "qty", "revenue", "partner_programs", "bonus_points", "cost_total",
                  "commission", "acquiring", "tax", "logistics", "promo", "installment", "other_costs", "profit", "margin_pct"]
     available = [c for c in show_cols if c in df.columns]
     display_df = df[available].copy()
@@ -1155,6 +1192,8 @@ with tab1:
         "name": "Товар",
         "qty": "Продано",
         "revenue": "Выручка",
+        "partner_programs": "Программы партнёров",
+        "bonus_points": "Баллы за скидки",
         "cost_total": "Себестоимость",
         "commission": "Комиссия",
         "acquiring": "Эквайринг",
@@ -1173,7 +1212,7 @@ with tab1:
         if pd.isna(v): return "—"
         return ru_rub(v, 0)
 
-    rub_cols = ["Выручка", "Себестоимость", "Комиссия", "Эквайринг", "Налог", "Логистика", "Реклама", "Рассрочка", "Прочие расходы", "Прибыль"]
+    rub_cols = ["Выручка", "Программы партнёров", "Баллы за скидки", "Себестоимость", "Комиссия", "Эквайринг", "Налог", "Логистика", "Реклама", "Рассрочка", "Прочие расходы", "Прибыль"]
     fmt_dict = {c: _fmt_rub for c in rub_cols if c in display_df.columns}
     if "Маржа %" in display_df.columns:
         fmt_dict["Маржа %"] = ru_pct
@@ -1207,6 +1246,8 @@ with tab1:
     _total_inst  = df["installment"].abs().sum() if "installment" in df.columns else 0
     ci1, ci2, ci3, ci4 = st.columns(4)
     ci1.metric("Выручка", r(total_rev))
+    if total_partner or total_bonus:
+        ci1.caption(f"Доход с баллами и партнёркой: {r(total_income)}")
     ci2.metric("Прибыль", r(total_prof))
     ci3.metric("Маржа", ru_pct(total_margin))
     ci4.metric("Расходы (комиссия + логистика)", r(total_comm + total_log))
@@ -1255,6 +1296,8 @@ with tab1:
             "name":        "Товар",
             "qty":         "Продано шт",
             "revenue":     "Выручка",
+            "partner_programs": "Программы партнёров",
+            "bonus_points":     "Баллы за скидки",
             "cost_total":  "Себестоимость",
             "commission":  "Комиссия",
             "acquiring":   "Эквайринг",
@@ -1799,7 +1842,11 @@ with tab5:
             deliv = prod.get("delivery") or {}
             services = deliv.get("services") or []
 
-            revenue_v = float(((comm.get("sale_amount") or {}).get("amount") or 0))
+            # sale_amount/seller_price = ПОЛНАЯ сумма (Выручка+Программы+Баллы) — см. диагностику от 02.08.2026.
+            # Для деталки показываем настоящую Выручку (sale_price) + отдельно Программы/Баллы.
+            revenue_v = float(((comm.get("sale_price") or {}).get("amount") or 0))
+            partner_v = float(((comm.get("coinvestment") or {}).get("amount") or 0))
+            bonus_v   = float(((comm.get("bonus") or {}).get("amount") or 0))
             commission_v = float(((comm.get("sale_commission") or {}).get("amount") or 0))
             total_deliv_v = float(((deliv.get("total_accrued") or {}).get("amount") or 0))
 
@@ -1818,10 +1865,14 @@ with tab5:
                     "Название": TYPE_NAMES.get(tid, f"delivery type_id={tid}"),
                     "Сумма": amt,
                     "Выручка": revenue_v,
+                    "Программы партнёров": partner_v,
+                    "Баллы за скидки": bonus_v,
                     "Комиссия": commission_v,
                     "Доставка (итого)": total_deliv_v,
                 })
                 revenue_v = 0  # не дублируем выручку на каждый сервис одного заказа
+                partner_v = 0
+                bonus_v = 0
                 commission_v = 0
                 total_deliv_v = 0
 
@@ -1834,6 +1885,8 @@ with tab5:
                     "Название": "—",
                     "Сумма": 0,
                     "Выручка": revenue_v,
+                    "Программы партнёров": partner_v,
+                    "Баллы за скидки": bonus_v,
                     "Комиссия": commission_v,
                     "Доставка (итого)": total_deliv_v,
                 })
