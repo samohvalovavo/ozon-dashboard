@@ -253,6 +253,7 @@ def fetch_sku_map(client_id: str, api_key: str) -> dict:
     for schema, path in [("fbo", "/v3/posting/fbo/list"), ("fbs", "/v4/posting/fbs/list")]:
         try:
             offset = 0
+            page_size = 100 if schema == "fbs" else 1000  # v4/fbs max=100, v3/fbo max=1000
             while True:
                 body = {
                     "dir": "ASC",
@@ -260,7 +261,7 @@ def fetch_sku_map(client_id: str, api_key: str) -> dict:
                         "since": since + "T00:00:00.000Z",
                         "to":    to    + "T23:59:59.000Z",
                     },
-                    "limit": 1000, "offset": offset,
+                    "limit": page_size, "offset": offset,
                     "with": {"financial_data": False, "analytics_data": False}
                 }
                 resp = api_post(path, body, client_id, api_key)
@@ -289,7 +290,7 @@ def fetch_sku_map(client_id: str, api_key: str) -> dict:
                         if sku and offer_id and sku not in sku_map:
                             sku_map[sku] = offer_id
 
-                if len(postings) < 1000:
+                if len(postings) < page_size:
                     break
                 offset += len(postings)
         except Exception:
@@ -354,6 +355,7 @@ def fetch_name_map(client_id: str, api_key: str) -> dict:
     for schema, path in [("fbo", "/v3/posting/fbo/list"), ("fbs", "/v4/posting/fbs/list")]:
         try:
             offset = 0
+            page_size = 100 if schema == "fbs" else 1000  # v4/fbs max=100, v3/fbo max=1000
             while True:
                 body = {
                     "dir": "ASC",
@@ -361,24 +363,24 @@ def fetch_name_map(client_id: str, api_key: str) -> dict:
                         "since": since + "T00:00:00.000Z",
                         "to": to + "T23:59:59.000Z"
                     },
-                    "limit": 1000,
+                    "limit": page_size,
                     "offset": offset,
                     "with": {"financial_data": False, "analytics_data": False}
                 }
                 resp = api_post(path, body, client_id, api_key)
-                
+
                 if not resp:
                     break
-                    
+
                 result = resp.get("result", {})
                 if schema == "fbo":
                     postings = result if isinstance(result, list) else result.get("postings", [])
                 else:
                     postings = result.get("postings", []) if result else []
-                    
+
                 if not postings:
                     break
-                    
+
                 for p in postings:
                     if not isinstance(p, dict):
                         continue
@@ -389,8 +391,8 @@ def fetch_name_map(client_id: str, api_key: str) -> dict:
                         name = str(prod.get("name") or "")
                         if sku and name and sku not in name_map:
                             name_map[sku] = name
-                            
-                if len(postings) < 1000:
+
+                if len(postings) < page_size:
                     break
                 offset += len(postings)
         except Exception:
