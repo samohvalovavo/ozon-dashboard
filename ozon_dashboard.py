@@ -663,7 +663,7 @@ with st.sidebar:
         first_this = today.replace(day=1)
         d_to = first_this - timedelta(days=1)
         d_from = d_to.replace(day=1)
-        use_transactions = False
+        use_transactions = True
     else:
         d_from = st.date_input("Дата от", value=today.replace(day=1))
         d_to = st.date_input("Дата до", value=today)
