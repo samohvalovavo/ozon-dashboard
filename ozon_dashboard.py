@@ -248,11 +248,42 @@ def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
     """
     data = api_post("/v1/finance/accrual/types", {}, client_id, api_key)
     result = {}
-    for t in (data.get("types") or []):
-        tid = t.get("accrual_id") or t.get("type_id")
+    # API возвращает "accrual_types" (не "types")
+    items = data.get("accrual_types") or data.get("types") or []
+    for t in items:
+        tid = t.get("accrual_id") or t.get("type_id") or t.get("id")
         name = t.get("name") or t.get("title") or t.get("description")
         if tid is not None and name:
             result[int(tid)] = name
+    return result
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
+    """
+    /v2/product/info/list — маппинг числовых SKU → offer_id продавца.
+    Работает с большинством ролей API-ключа.
+    """
+    if not skus:
+        return {}
+    result = {}
+    sku_ints = [int(s) for s in skus if str(s).isdigit()]
+    for i in range(0, len(sku_ints), 100):
+        batch = sku_ints[i:i+100]
+        data = api_post("/v2/product/info/list", {"sku": batch}, client_id, api_key)
+        if not data:
+            continue
+        items = data.get("items") or data.get("result") or []
+        for item in (items if isinstance(items, list) else []):
+            if not isinstance(item, dict):
+                continue
+            offer_id = str(item.get("offer_id") or "")
+            if not offer_id:
+                continue
+            # SKU может быть в разных полях
+            for sku_field in ("fbo_sku", "fbs_sku", "sku"):
+                sv = item.get(sku_field)
+                if sv:
+                    result[str(sv)] = offer_id
     return result
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -897,13 +928,25 @@ if load_btn:
                         if api_type_names:
                             TYPE_NAMES.update(api_type_names)
 
-                    # Загружаем справочник sku → offer_id
+                    # Загружаем справочник sku → offer_id через FBO/FBS (если есть права)
                     with st.spinner("Загружаем справочник артикулов..."):
                         sku_map = fetch_sku_map(client_id, api_key)
                     if sku_map:
                         name_map = fetch_name_map(client_id, api_key)
                         raw_df = apply_sku_map(raw_df, sku_map, name_map)
-                        st.caption(f"Справочник: {len(sku_map)} товаров, {len(name_map) if name_map else 0} названий")
+                        st.caption(f"Справочник FBO/FBS: {len(sku_map)} товаров")
+                    else:
+                        # Fallback: Product Info API — по числовым SKU из транзакций
+                        with st.spinner("FBO/FBS недоступен, запрашиваем артикулы через Product API..."):
+                            _unique_skus = tuple(sorted(raw_df["sku"].unique().tolist())) if "sku" in raw_df.columns else ()
+                            _offer_id_map = fetch_offer_ids_by_sku(client_id, api_key, _unique_skus)
+                        if _offer_id_map:
+                            raw_df["article"] = raw_df["sku"].map(_offer_id_map).fillna(raw_df["article"])
+                            raw_df["article"] = raw_df["article"].astype(str)
+                            sku_map = _offer_id_map  # используем как sku_map для Tab5
+                            st.caption(f"Product API: {len(_offer_id_map)} артикулов")
+                        else:
+                            st.warning("Не удалось получить артикулы: проверь права API-ключа (нужен доступ к FBO/FBS или Products)")
 
                     if use_transactions:
                         # Транзакционный режим — логистика уже в raw_df
@@ -1639,6 +1682,38 @@ with tab5:
                 st.warning("Пустой ответ от /v1/finance/accrual/types")
         else:
             st.info("Введи API-ключи чтобы увидеть справочник типов")
+
+        # 8. Диагностика FBO/FBS list — почему sku_map пустой?
+        st.subheader("Диагностика: FBO/FBS list (почему sku_map пустой?)")
+        if client_id and api_key:
+            import datetime as _dt
+            _today = _dt.date.today()
+            _since = (_today - _dt.timedelta(days=30)).strftime("%Y-%m-%d")
+            _to_s  = _today.strftime("%Y-%m-%d")
+            for _schema, _path in [("FBO /v3", "/v3/posting/fbo/list"), ("FBS /v4", "/v4/posting/fbs/list")]:
+                with st.spinner(f"Запрос {_schema}..."):
+                    _body = {
+                        "dir": "ASC",
+                        "filter": {"since": _since + "T00:00:00.000Z", "to": _to_s + "T23:59:59.000Z"},
+                        "limit": 5, "offset": 0,
+                        "with": {"financial_data": False, "analytics_data": False}
+                    }
+                    _resp = api_post(_path, _body, client_id, api_key)
+                st.markdown(f"**{_schema}** (`{_since}` → `{_to_s}`):")
+                if _resp is None:
+                    st.error(f"{_schema}: ответ None — скорее всего ошибка авторизации или API")
+                else:
+                    _result = _resp.get("result", {})
+                    _postings = _result if isinstance(_result, list) else _result.get("postings", [])
+                    st.write(f"Найдено заказов (первые 5): {len(_postings)}")
+                    if _postings:
+                        _sample = _postings[0]
+                        _prods = (_sample.get("products") or [])[:2]
+                        st.write("Пример товаров:", _prods)
+                    else:
+                        st.json(_resp)  # покажем полный ответ если пусто
+        else:
+            st.info("Введи API-ключи")
 
     # Обратный справочник: offer_id → список numeric SKU
     reverse_map: dict[str, list[str]] = {}
