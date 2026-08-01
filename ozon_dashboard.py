@@ -174,21 +174,47 @@ def collect_store_costs(ops: list[dict]) -> dict[int, float]:
 # ── Ozon API ────────────────────────────────────────────────────────────────
 API_URL = "https://api-seller.ozon.ru"
 
-def api_post(endpoint: str, body: dict, client_id: str, api_key: str) -> dict:
+def api_post(endpoint: str, body: dict, client_id: str, api_key: str, _retries: int = 4) -> dict:
+    """
+    Запрос к Ozon Seller API.
+    При 429 (rate limit) — тихо ждём и повторяем (до _retries раз, с нарастающей паузой),
+    вместо того чтобы сразу показывать ошибку пользователю. Ozon режет по запросам в секунду,
+    и при плотных сериях вызовов (диагностика, маппинг SKU, постраничная загрузка) это
+    ожидаемая, а не аварийная ситуация — добавлено 02.08.2026.
+    """
     headers = {
         "Client-Id": client_id,
         "Api-Key":   api_key,
         "Content-Type": "application/json",
     }
-    try:
-        r = requests.post(API_URL + endpoint, json=body, headers=headers, timeout=30)
+    import time as _time
+    delay = 0.5
+    for attempt in range(_retries + 1):
+        try:
+            r = requests.post(API_URL + endpoint, json=body, headers=headers, timeout=30)
+        except Exception as e:
+            if attempt < _retries:
+                _time.sleep(delay)
+                delay *= 2
+                continue
+            st.error(f"Ошибка соединения с API: {e}")
+            return {}
+
+        if r.status_code == 429:
+            if attempt < _retries:
+                _time.sleep(delay)
+                delay *= 2
+                continue
+            st.error(f"Ошибка API 429: превышен лимит запросов в секунду, повторные попытки не помогли ({r.text[:200]})")
+            return {}
+
         if r.status_code != 200:
             st.error(f"Ошибка API {r.status_code}: {r.text[:300]}")
             return {}
+
         return r.json()
-    except Exception as e:
-        st.error(f"Ошибка соединения с API: {e}")
-        return {}
+
+    return {}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_realization(client_id: str, api_key: str, year: int, month: int) -> list[dict]:
@@ -313,17 +339,27 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     except Exception:
         pass
 
-    def _api_post_silent(endpoint: str, body: dict) -> dict:
+    def _api_post_silent(endpoint: str, body: dict, _retries: int = 3) -> dict:
         """Как api_post(), но без st.error — для best-effort догоматчинга, где часть
-        запросов ожидаемо не найдёт товар (устаревший SKU, архив и т.п.)."""
-        try:
-            headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
-            resp = requests.post(API_URL + endpoint, json=body, headers=headers, timeout=30)
+        запросов ожидаемо не найдёт товар (устаревший SKU, архив и т.п.). При 429 тоже
+        тихо ждёт и повторяет — иначе под рейт-лимитом маппинг массово проваливался бы
+        молча, даже когда повтор мог бы сработать."""
+        import time as _time
+        headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
+        delay = 0.5
+        for attempt in range(_retries + 1):
+            try:
+                resp = requests.post(API_URL + endpoint, json=body, headers=headers, timeout=30)
+            except Exception:
+                return {}
+            if resp.status_code == 429 and attempt < _retries:
+                _time.sleep(delay)
+                delay *= 2
+                continue
             if resp.status_code != 200:
                 return {}
             return resp.json()
-        except Exception:
-            return {}
+        return {}
 
     missing = [s for s in sku_strings if s not in result]
 
