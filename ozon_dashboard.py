@@ -253,7 +253,7 @@ def fetch_sku_map(client_id: str, api_key: str) -> dict:
     for schema, path in [("fbo", "/v3/posting/fbo/list"), ("fbs", "/v4/posting/fbs/list")]:
         try:
             offset = 0
-            page_size = 100 if schema == "fbs" else 1000  # v4/fbs max=100, v3/fbo max=1000
+            page_size = 100  # v3/fbo и v4/fbs оба имеют max=100
             while True:
                 body = {
                     "dir": "ASC",
@@ -355,7 +355,7 @@ def fetch_name_map(client_id: str, api_key: str) -> dict:
     for schema, path in [("fbo", "/v3/posting/fbo/list"), ("fbs", "/v4/posting/fbs/list")]:
         try:
             offset = 0
-            page_size = 100 if schema == "fbs" else 1000  # v4/fbs max=100, v3/fbo max=1000
+            page_size = 100  # v3/fbo и v4/fbs оба имеют max=100
             while True:
                 body = {
                     "dir": "ASC",
