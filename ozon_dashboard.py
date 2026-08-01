@@ -80,6 +80,24 @@ def r(n: float) -> str:
 
 
 # fee_type_id → читаемое название (item_fees и delivery.services)
+# Перевод английских названий типов начислений (Ozon API возвращает en-названия)
+_ACCRUAL_EN_TO_RU: dict[str, str] = {
+    "PremiumSubscription":          "Подписка Premium",
+    "Promotion":                    "Продвижение / Реклама",
+    "PayPerClick":                  "Оплата за клик",
+    "AcceleratedReviewCollection":  "Ускоренный сбор отзывов",
+    "ItemCompensation":             "Компенсация за товар",
+    "Placements":                   "Размещение рекламы",
+    "DefectFineErrors":             "Штраф (ошибки)",
+    "DefectFineShipmentDelayRate":  "Штраф (задержка отгрузки)",
+    "StorageFee":                   "Хранение на складе",
+    "Acquiring":                    "Эквайринг",
+    "Installment":                  "Рассрочка",
+    "Logistics":                    "Логистика",
+    "Return":                       "Возврат",
+    "Sale":                         "Продажа",
+}
+
 TYPE_NAMES: dict[int, str] = {
     1:  "Эквайринг",
     3:  "Реклама / Продвижение бренда",
@@ -236,7 +254,8 @@ def fetch_transactions(client_id: str, api_key: str, date_from: str, date_to: st
         cur += timedelta(days=1)
         day_count += 1
         progress_bar.progress(min(day_count / total_days, 1.0))
-    
+        import time; time.sleep(0.15)  # пауза между днями — избегаем 429
+
     progress_bar.empty()
     return all_accruals
 
@@ -254,7 +273,7 @@ def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
         tid = t.get("accrual_id") or t.get("type_id") or t.get("id")
         name = t.get("name") or t.get("title") or t.get("description")
         if tid is not None and name:
-            result[int(tid)] = name
+            result[int(tid)] = _ACCRUAL_EN_TO_RU.get(name, name)
     return result
 
 @st.cache_data(ttl=3600, show_spinner=False)
