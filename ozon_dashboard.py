@@ -260,30 +260,48 @@ def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     """
-    /v2/product/info/list — маппинг числовых SKU → offer_id продавца.
-    Работает с большинством ролей API-ключа.
+    Маппинг числовых SKU → offer_id продавца.
+    Сначала пробует /v1/analytics/turnover/stocks (Product read-only),
+    затем /v1/product/info для каждого SKU как запасной вариант.
     """
     if not skus:
         return {}
     result = {}
-    sku_ints = [int(s) for s in skus if str(s).isdigit()]
-    for i in range(0, len(sku_ints), 100):
-        batch = sku_ints[i:i+100]
-        data = api_post("/v2/product/info/list", {"sku": batch}, client_id, api_key)
-        if not data:
-            continue
-        items = data.get("items") or data.get("result") or []
-        for item in (items if isinstance(items, list) else []):
-            if not isinstance(item, dict):
-                continue
-            offer_id = str(item.get("offer_id") or "")
-            if not offer_id:
-                continue
-            # SKU может быть в разных полях
-            for sku_field in ("fbo_sku", "fbs_sku", "sku"):
-                sv = item.get(sku_field)
-                if sv:
-                    result[str(sv)] = offer_id
+
+    # Попытка 1: /v1/analytics/turnover/stocks — принимает список SKU, возвращает offer_id
+    sku_strings = [str(s) for s in skus]
+    try:
+        for i in range(0, len(sku_strings), 500):
+            batch = sku_strings[i:i+500]
+            data = api_post("/v1/analytics/turnover/stocks",
+                            {"sku": batch, "limit": len(batch), "offset": 0},
+                            client_id, api_key)
+            if not data:
+                break
+            for item in (data.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                offer_id = str(item.get("offer_id") or "")
+                sku_val  = str(item.get("sku") or "")
+                if offer_id and sku_val:
+                    result[sku_val] = offer_id
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # Попытка 2: /v1/product/info — по одному SKU (медленнее, но надёжнее)
+    for sku_str in sku_strings[:50]:  # лимит 50 чтобы не перегружать
+        try:
+            data = api_post("/v1/product/info", {"sku": int(sku_str)}, client_id, api_key)
+            if data:
+                item = data.get("result") or data
+                offer_id = str(item.get("offer_id") or "")
+                if offer_id:
+                    result[sku_str] = offer_id
+        except Exception:
+            pass
+
     return result
 
 @st.cache_data(ttl=3600, show_spinner=False)
