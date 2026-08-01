@@ -240,6 +240,21 @@ def fetch_transactions(client_id: str, api_key: str, date_from: str, date_to: st
     progress_bar.empty()
     return all_accruals
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
+    """
+    /v1/finance/accrual/types — справочник всех type_id с названиями.
+    Возвращает {type_id: название}.
+    """
+    data = api_post("/v1/finance/accrual/types", {}, client_id, api_key)
+    result = {}
+    for t in (data.get("types") or []):
+        tid = t.get("accrual_id") or t.get("type_id")
+        name = t.get("name") or t.get("title") or t.get("description")
+        if tid is not None and name:
+            result[int(tid)] = name
+    return result
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_sku_map(client_id: str, api_key: str) -> dict:
     """
@@ -865,6 +880,12 @@ if load_btn:
                 if raw_df.empty:
                     st.warning("Нет данных за выбранный период. Отчёт реализации формируется Ozon в начале следующего месяца.")
                 else:
+                    # Загружаем справочник типов начислений (type_id → название)
+                    with st.spinner("Загружаем справочник типов начислений..."):
+                        api_type_names = fetch_accrual_types(client_id, api_key)
+                        if api_type_names:
+                            TYPE_NAMES.update(api_type_names)
+
                     # Загружаем справочник sku → offer_id
                     with st.spinner("Загружаем справочник артикулов..."):
                         sku_map = fetch_sku_map(client_id, api_key)
