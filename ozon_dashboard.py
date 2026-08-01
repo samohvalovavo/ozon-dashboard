@@ -287,7 +287,13 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
         return {}
     result = {}
 
-    # Попытка 1: /v1/analytics/turnover/stocks — принимает список SKU, возвращает offer_id
+    # Попытка 1: /v1/analytics/turnover/stocks — принимает список SKU, возвращает offer_id.
+    # ВАЖНО: этот отчёт покрывает только SKU с оборачиваемостью/остатками за период — товары
+    # с нулевым остатком/редкими продажами он может не вернуть вообще. Раньше код при ЛЮБОМ
+    # непустом результате сразу возвращал его (`if result: return result`) и НИКОГДА не пытался
+    # доматчить оставшиеся SKU через /v1/product/info — из-за этого часть артикулов
+    # отображалась как «сырой» числовой SKU вместо реального артикула. Исправлено 02.08.2026:
+    # теперь для всех SKU, которых не нашлось в turnover/stocks, всегда идём в fallback.
     sku_strings = [str(s) for s in skus]
     try:
         for i in range(0, len(sku_strings), 500):
@@ -296,7 +302,7 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
                             {"sku": batch, "limit": len(batch), "offset": 0},
                             client_id, api_key)
             if not data:
-                break
+                continue
             for item in (data.get("items") or []):
                 if not isinstance(item, dict):
                     continue
@@ -304,13 +310,12 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
                 sku_val  = str(item.get("sku") or "")
                 if offer_id and sku_val:
                     result[sku_val] = offer_id
-        if result:
-            return result
     except Exception:
         pass
 
-    # Попытка 2: /v1/product/info — по одному SKU (медленнее, но надёжнее)
-    for sku_str in sku_strings[:50]:  # лимит 50 чтобы не перегружать
+    # Попытка 2: /v1/product/info — по одному SKU, ТОЛЬКО для тех, что не нашлись выше.
+    missing = [s for s in sku_strings if s not in result]
+    for sku_str in missing[:300]:  # лимит 300, чтобы не перегружать API при больших каталогах
         try:
             data = api_post("/v1/product/info", {"sku": int(sku_str)}, client_id, api_key)
             if data:
