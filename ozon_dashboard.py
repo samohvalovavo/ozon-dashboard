@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 13:34"
+APP_BUILD_VERSION = "02.08.2026 13:40"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -891,16 +891,17 @@ def realization_to_df(rows: list[dict]) -> pd.DataFrame:
 
     return grouped
 
-def enrich_with_cost(df: pd.DataFrame, cost_map: dict, perf_ad_map: dict = None) -> pd.DataFrame:
+def enrich_with_cost(df: pd.DataFrame, cost_map: dict, cpc_ad_map: dict = None, cpo_ad_map: dict = None) -> pd.DataFrame:
     """
     Добавляем себестоимость, налог, эквайринг и считаем прибыль.
 
-    perf_ad_map: {sku: расход в рублях} из Performance API (реклама CPC/CPO).
-    Если передан — распределяется по артикулам через колонку "ads_perf" и
-    вычитается из прибыли. Sku, которых нет в df (например, показы были,
-    а продаж в периоде не было), сюда НЕ попадают — их сумма учитывается
-    отдельно на уровне «Расходов магазина» (см. основной блок ниже), чтобы
-    деньги не терялись из P&L.
+    cpc_ad_map / cpo_ad_map: {sku: расход в рублях} из Performance API — CPC (оплата
+    за клик) и CPO (оплата за заказ) ОТДЕЛЬНО, чтобы в таблице по артикулам было видно
+    каждую статью раздельно, а не одной смешанной суммой. Складываются в "ads_perf"
+    (используется в расчёте прибыли, как раньше). Sku, которых нет в df (например,
+    показы были, а продаж в периоде не было), сюда НЕ попадают — их сумма учитывается
+    отдельно на уровне «Расходов магазина» (см. основной блок ниже), чтобы деньги не
+    терялись из P&L.
     """
     if df.empty:
         return df
@@ -938,13 +939,13 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict, perf_ad_map: dict = None)
     if "other_costs" not in df.columns:
         df["other_costs"] = 0.0
 
-    # Реклама CPC/CPO по артикулам (Performance API) — только если передан perf_ad_map.
-    # Если не передан (Performance API не подключён / выключен галочкой) — колонка нулевая,
-    # и эта статья расхода остаётся там же, где была раньше: одной суммой в "Расходах магазина".
-    if perf_ad_map:
-        df["ads_perf"] = df["sku"].astype(str).map(perf_ad_map).fillna(0.0)
-    else:
-        df["ads_perf"] = 0.0
+    # Реклама CPC и CPO по артикулам (Performance API), отдельными колонками — только если
+    # переданы карты. Если не переданы (Performance API не подключён / выключен галочкой) —
+    # колонки нулевые, и эта статья расхода остаётся там же, где была раньше: одной суммой
+    # в "Расходах магазина".
+    df["ads_cpc"] = df["sku"].astype(str).map(cpc_ad_map).fillna(0.0) if cpc_ad_map else 0.0
+    df["ads_cpo"] = df["sku"].astype(str).map(cpo_ad_map).fillna(0.0) if cpo_ad_map else 0.0
+    df["ads_perf"] = df["ads_cpc"] + df["ads_cpo"]
 
     df["profit"] = (
         df["total_income"]
@@ -1224,8 +1225,8 @@ def fetch_performance_ad_spend(
     out = {
         "by_sku": {}, "total": 0.0, "fetched": True, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [],
-        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None,
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {},
+        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {},
     }
     try:
         token = get_performance_token(perf_client_id, perf_client_secret)
@@ -1276,6 +1277,8 @@ def fetch_performance_ad_spend(
         out["cpo_raw_sample"] = cpo_result.get("raw_sample")
         out["cpo_ok"] = not out["cpo_error"]
     out["cpo_total"] = sum(cpo_by_sku.values())
+    out["cpc_by_sku"] = cpc_by_sku
+    out["cpo_by_sku"] = cpo_by_sku
 
     # ── Объединяем ─────────────────────────────────────────────────────────
     combined: dict[str, float] = {}
@@ -1487,8 +1490,8 @@ if "perf_ad_meta" not in st.session_state:
     st.session_state.perf_ad_meta = {
         "total": 0.0, "fetched": False, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [],
-        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None,
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {},
+        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {},
     }
 
 if demo_btn:
@@ -1549,8 +1552,8 @@ if load_btn:
         st.session_state.perf_ad_meta = {
             "total": 0.0, "fetched": False, "error": None,
             "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-            "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [],
-            "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None,
+            "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {},
+            "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {},
         }
         with st.spinner("Загружаем данные из Ozon API..."):
             try:
@@ -1686,13 +1689,12 @@ if load_btn:
                             with st.expander("🔍 Сырой пример строк CPO-отчёта (для диагностики)", expanded=bool(perf_result["cpo_error"])):
                                 st.json(perf_result["cpo_raw_sample"])
 
-                    _perf_map_for_profit = (
-                        st.session_state.perf_ad_spend
-                        if (use_perf_ads and st.session_state.perf_ad_spend)
-                        else {}
-                    )
+                    _perf_cpc_map = st.session_state.perf_ad_meta.get("cpc_by_sku", {}) if use_perf_ads else {}
+                    _perf_cpo_map = st.session_state.perf_ad_meta.get("cpo_by_sku", {}) if use_perf_ads else {}
                     # enrich_with_cost вызывается ПОСЛЕ обновления логистики
-                    st.session_state.df = enrich_with_cost(raw_df, cost_map, perf_ad_map=_perf_map_for_profit)
+                    st.session_state.df = enrich_with_cost(
+                        raw_df, cost_map, cpc_ad_map=_perf_cpc_map, cpo_ad_map=_perf_cpo_map,
+                    )
                     st.session_state._cost_map_debug = cost_map  # для диагностики в Tab5
                     st.session_state.is_demo = False
                     st.session_state.loaded_period = (d_from, d_to)
@@ -1904,7 +1906,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 По артикулам", "📦 О
 
 with tab1:
     show_cols = ["article", "name", "qty", "revenue", "partner_programs", "bonus_points", "cost_total",
-                 "commission", "acquiring", "tax", "logistics", "promo", "ads_perf", "installment", "other_costs", "profit", "margin_pct"]
+                 "commission", "acquiring", "tax", "logistics", "promo", "ads_cpc", "ads_cpo", "installment", "other_costs", "profit", "margin_pct"]
     available = [c for c in show_cols if c in df.columns]
     display_df = df[available].copy()
 
@@ -1921,7 +1923,8 @@ with tab1:
         "tax": "Налог",
         "logistics": "Логистика",
         "promo":       "Реклама",
-        "ads_perf":    "Реклама CPC/CPO",
+        "ads_cpc":     "Реклама CPC",
+        "ads_cpo":     "Реклама CPO",
         "installment": "Рассрочка",
         "other_costs": "Прочие расходы",
         "profit": "Прибыль",
@@ -1934,7 +1937,7 @@ with tab1:
         if pd.isna(v): return "—"
         return ru_rub(v, 0)
 
-    rub_cols = ["Выручка", "Программы партнёров", "Баллы за скидки", "Себестоимость", "Комиссия", "Эквайринг", "Налог", "Логистика", "Реклама", "Реклама CPC/CPO", "Рассрочка", "Прочие расходы", "Прибыль"]
+    rub_cols = ["Выручка", "Программы партнёров", "Баллы за скидки", "Себестоимость", "Комиссия", "Эквайринг", "Налог", "Логистика", "Реклама", "Реклама CPC", "Реклама CPO", "Рассрочка", "Прочие расходы", "Прибыль"]
     fmt_dict = {c: _fmt_rub for c in rub_cols if c in display_df.columns}
     if "Маржа %" in display_df.columns:
         fmt_dict["Маржа %"] = ru_pct
@@ -2029,7 +2032,8 @@ with tab1:
             "tax":         "Налог",
             "logistics":   "Логистика",
             "promo":       "Реклама",
-            "ads_perf":    "Реклама CPC/CPO",
+            "ads_cpc":     "Реклама CPC",
+            "ads_cpo":     "Реклама CPO",
             "installment": "Рассрочка",
             "other_costs": "Прочие расходы",
             "profit":      "Прибыль",
