@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 13:10"
+APP_BUILD_VERSION = "02.08.2026 13:17"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -143,7 +143,13 @@ INSTALLMENT_TYPE_ID = 22
 # она уже приходит per-SKU напрямую из Seller API (item_fees) и не нуждается в замене.
 PERFORMANCE_API_URL = "https://api-performance.ozon.ru"
 PERFORMANCE_STORE_TYPE_IDS = {41, 54}   # что именно заменяется в "Расходах магазина"
-PERFORMANCE_AD_PAYMENT_TYPES = {"CPC", "CPO"}   # какие кампании Performance API считаем
+# Документация Ozon непоследовательна в написании paymentType в разных методах (где-то
+# пример "CPC", где-то "CAMPAIGN_TYPE_..."), поэтому фильтруем kампании ДВУМЯ способами
+# и объединяем через ИЛИ: по advObjectType (для GET /api/client/campaign это задокументировано
+# однозначно: SKU = Оплата за клик, SEARCH_PROMO = Оплата за заказ) и запасной вариант —
+# по вхождению CPC/CPO в paymentType (регистронезависимо, на случай другого формата поля).
+PERFORMANCE_AD_OBJECT_TYPES = {"SKU", "SEARCH_PROMO"}
+PERFORMANCE_AD_PAYMENT_TYPES = {"CPC", "CPO"}   # подстрокой, см. комментарий выше
 
 # non_item_fee — расходы магазина (не на артикул, а на кабинет в целом)
 # Группы для отображения в блоке "Расходы магазина"
@@ -1032,16 +1038,46 @@ def fetch_performance_ad_spend(
     out = {
         "by_sku": {}, "total": 0.0, "campaigns_used": 0,
         "campaigns_failed": [], "error": None, "fetched": True,
+        "raw_campaigns_count": 0, "raw_campaigns_sample": [],
     }
     try:
         token = get_performance_token(perf_client_id, perf_client_secret)
         campaigns = fetch_performance_campaigns(token)
-        ad_campaign_ids = [
-            str(c.get("id")) for c in campaigns
-            if str(c.get("paymentType") or "").upper() in PERFORMANCE_AD_PAYMENT_TYPES
+        out["raw_campaigns_count"] = len(campaigns)
+        # Для диагностики — реальные значения полей, чтобы не гадать по (местами
+        # противоречивой) документации, если фильтр ниже вдруг снова ничего не найдёт.
+        out["raw_campaigns_sample"] = [
+            {
+                "id": c.get("id"), "title": c.get("title"),
+                "paymentType": c.get("paymentType"), "advObjectType": c.get("advObjectType"),
+                "state": c.get("state"),
+            }
+            for c in campaigns[:20] if isinstance(c, dict)
         ]
+
+        def _is_ad_campaign(c: dict) -> bool:
+            adv = str(c.get("advObjectType") or "").upper()
+            pay = str(c.get("paymentType") or "").upper()
+            if adv in PERFORMANCE_AD_OBJECT_TYPES:
+                return True
+            return any(t in pay for t in PERFORMANCE_AD_PAYMENT_TYPES)
+
+        ad_campaign_ids = [str(c.get("id")) for c in campaigns if isinstance(c, dict) and _is_ad_campaign(c)]
+
         if not ad_campaign_ids:
-            out["error"] = "В кабинете Performance API не найдено CPC/CPO кампаний"
+            if not campaigns:
+                out["error"] = (
+                    "Performance API вернул пустой список кампаний (0 штук) — похоже, у этой "
+                    "пары Client-ID/Secret нет доступа к рекламному кабинету. Проверь, что "
+                    "сервисный аккаунт создан с ролью, дающей доступ к Performance API, и что "
+                    "это тот же кабинет, где видна реклама в личном ЛК."
+                )
+            else:
+                out["error"] = (
+                    f"Получено {len(campaigns)} кампаний, но ни одна не распознана как CPC/CPO "
+                    f"по полям advObjectType/paymentType — см. «raw_campaigns_sample» в "
+                    f"диагностике (Tab5 → Performance API), там реальные значения этих полей."
+                )
             return out
         by_sku, failed = fetch_performance_sku_expense(token, ad_campaign_ids, date_from, date_to)
         out["by_sku"] = by_sku
@@ -1237,6 +1273,7 @@ if "perf_ad_meta" not in st.session_state:
     st.session_state.perf_ad_meta = {
         "total": 0.0, "campaigns_used": 0, "campaigns_failed": [],
         "error": None, "fetched": False,
+        "raw_campaigns_count": 0, "raw_campaigns_sample": [],
     }
 
 if demo_btn:
@@ -1297,6 +1334,7 @@ if load_btn:
         st.session_state.perf_ad_meta = {
             "total": 0.0, "campaigns_used": 0, "campaigns_failed": [],
             "error": None, "fetched": False,
+            "raw_campaigns_count": 0, "raw_campaigns_sample": [],
         }
         with st.spinner("Загружаем данные из Ozon API..."):
             try:
@@ -1393,6 +1431,17 @@ if load_btn:
                                 f"не будет учтена в этой загрузке, «Расходы магазина» остаются как раньше "
                                 f"(одна сумма CPC/CPO на весь магазин из Seller API)."
                             )
+                            if perf_result.get("raw_campaigns_sample"):
+                                with st.expander(
+                                    f"🔍 Сырые кампании из Performance API "
+                                    f"(всего {perf_result.get('raw_campaigns_count', 0)}, показаны первые "
+                                    f"{len(perf_result['raw_campaigns_sample'])})",
+                                    expanded=True,
+                                ):
+                                    st.dataframe(
+                                        pd.DataFrame(perf_result["raw_campaigns_sample"]),
+                                        use_container_width=True, hide_index=True,
+                                    )
                         elif perf_result["campaigns_failed"]:
                             st.warning(
                                 f"⚠️ Performance API: не ответили {len(perf_result['campaigns_failed'])} "
@@ -2178,6 +2227,17 @@ with tab5:
                 st.error(f"Ошибка Performance API при последней загрузке: {_perf_meta_diag['error']}")
             elif not _perf_meta_diag.get("fetched"):
                 st.info("Performance API не запрашивался — не заполнены Performance Client-ID/Secret в боковом меню.")
+            if _perf_meta_diag.get("raw_campaigns_sample"):
+                st.caption(
+                    f"Сырые кампании из GET /api/client/campaign (всего "
+                    f"{_perf_meta_diag.get('raw_campaigns_count', 0)}, показаны первые "
+                    f"{len(_perf_meta_diag['raw_campaigns_sample'])}) — реальные значения "
+                    f"paymentType/advObjectType, по которым идёт фильтр CPC/CPO:"
+                )
+                st.dataframe(
+                    pd.DataFrame(_perf_meta_diag["raw_campaigns_sample"]),
+                    use_container_width=True, hide_index=True,
+                )
         else:
             st.warning("df ещё не загружен — сначала нажмите «Загрузить данные»")
 
