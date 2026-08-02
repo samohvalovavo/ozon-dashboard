@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 13:17"
+APP_BUILD_VERSION = "02.08.2026 13:29"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -142,14 +142,18 @@ INSTALLMENT_TYPE_ID = 22
 # Медийная/баннерная реклама (type_id 3, "Реклама / Продвижение бренда") сюда НЕ входит —
 # она уже приходит per-SKU напрямую из Seller API (item_fees) и не нуждается в замене.
 PERFORMANCE_API_URL = "https://api-performance.ozon.ru"
-PERFORMANCE_STORE_TYPE_IDS = {41, 54}   # что именно заменяется в "Расходах магазина"
-# Документация Ozon непоследовательна в написании paymentType в разных методах (где-то
-# пример "CPC", где-то "CAMPAIGN_TYPE_..."), поэтому фильтруем kампании ДВУМЯ способами
-# и объединяем через ИЛИ: по advObjectType (для GET /api/client/campaign это задокументировано
-# однозначно: SKU = Оплата за клик, SEARCH_PROMO = Оплата за заказ) и запасной вариант —
-# по вхождению CPC/CPO в paymentType (регистронезависимо, на случай другого формата поля).
-PERFORMANCE_AD_OBJECT_TYPES = {"SKU", "SEARCH_PROMO"}
-PERFORMANCE_AD_PAYMENT_TYPES = {"CPC", "CPO"}   # подстрокой, см. комментарий выше
+# В Ozon это ДВА структурно разных типа рекламы, с разными эндпоинтами статистики:
+#  - CPC ("Трафареты", advObjectType=SKU) → POST /api/client/statistics/products/sku
+#  - CPO ("Оплата за заказ", advObjectType=SEARCH_PROMO/ALL_SKU_PROMO) → отдельный
+#    асинхронный отчёт /api/client/statistics/all_sku_promo/orders/generate
+#    (products/sku эту модель не покрывает — подтверждено на реальном кабинете 02.08.2026:
+#    кампания "Оплата за заказ - все товары" не давала расход через products/sku).
+# type_id 41 (Seller API, "Оплата за клик") = CPC, type_id 54 ("Продвижение с оплатой
+# за заказ") = CPO — исключаются из "Расходов магазина" НЕЗАВИСИМО друг от друга,
+# только если соответствующий источник реально отдал данные (см. cpc_ok/cpo_ok ниже).
+PERFORMANCE_CPC_STORE_TYPE_ID = 41
+PERFORMANCE_CPO_STORE_TYPE_ID = 54
+PERFORMANCE_STORE_TYPE_IDS = {PERFORMANCE_CPC_STORE_TYPE_ID, PERFORMANCE_CPO_STORE_TYPE_ID}
 
 # non_item_fee — расходы магазина (не на артикул, а на кабинет в целом)
 # Группы для отображения в блоке "Расходы магазина"
@@ -997,7 +1001,9 @@ def fetch_performance_sku_expense(
     token: str, campaign_ids: list[str], date_from: str, date_to: str,
 ) -> tuple[dict[str, float], list[str]]:
     """
-    POST /api/client/statistics/products/sku — расход по SKU за период.
+    POST /api/client/statistics/products/sku — расход по SKU за период, ТОЛЬКО для
+    CPC-кампаний (advObjectType=SKU, "Трафареты"/оплата за клик). Для CPO ("Оплата за
+    заказ") этот метод пуст — см. fetch_all_sku_promo_orders_report ниже.
     По документации метод "не расходует лимиты Performance API". Батчим по 50
     кампаний на запрос — про максимальный размер campaignIds в одном вызове
     документация ничего не говорит, батч подстраховывает от больших кабинетов.
@@ -1028,64 +1034,252 @@ def fetch_performance_sku_expense(
             totals[sku] = totals.get(sku, 0.0) + float(row.get("expense") or 0)
     return totals, failed
 
+def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], str]:
+    """
+    Парсит файл 'Оплата за заказ (все товары). Отчёт по заказам', выгружаемый вручную
+    из личного кабинета Ozon (xlsx/csv). Формат подтверждён на реальном файле
+    пользователя 02.08.2026: первые 2 строки — период и заголовок отчёта, 3-я —
+    заголовки колонок (Дата, ID заказа, Номер заказа, SKU, SKU продвигаемого товара,
+    Артикул, Название товара, Количество, Стоимость продажи ₽, Стоимость ₽,
+    Ставка %, Ставка ₽, Расход ₽).
+
+    Берём колонку "SKU" (что реально продано), а НЕ "SKU продвигаемого товара"
+    (может отличаться при кросс-показах) — расход ложится на тот же артикул,
+    по которому в таблице уже считается выручка.
+
+    Возвращает (sku → сумма расхода, текст ошибки или "" если всё ок).
+    """
+    try:
+        name = (getattr(uploaded_file, "name", "") or "").lower()
+        if name.endswith(".csv"):
+            raw = pd.read_csv(uploaded_file, header=None, sep=None, engine="python")
+        else:
+            raw = pd.read_excel(uploaded_file, header=None)
+    except Exception as e:
+        return {}, f"Не удалось прочитать файл: {e}"
+
+    header_row_idx = None
+    for i in range(min(10, len(raw))):
+        vals = [str(v).strip() for v in raw.iloc[i].tolist()]
+        if "SKU" in vals:
+            header_row_idx = i
+            break
+    if header_row_idx is None:
+        return {}, "Не нашла строку с заголовками колонок (ищу ячейку 'SKU') — формат файла отличается от ожидаемого"
+
+    headers = [str(v).strip() for v in raw.iloc[header_row_idx].tolist()]
+    data = raw.iloc[header_row_idx + 1:].copy()
+    data.columns = headers
+
+    sku_col = next((c for c in headers if c == "SKU"), None)
+    expense_col = next((c for c in headers if str(c).strip().lower().startswith("расход")), None)
+    if not sku_col or not expense_col:
+        return {}, f"Не нашла колонки 'SKU' / 'Расход, ₽'. Колонки в файле: {headers}"
+
+    data = data[[sku_col, expense_col]].dropna(subset=[sku_col])
+    data[sku_col] = data[sku_col].astype(str).str.strip()
+    data = data[data[sku_col].str.len() > 0]
+    data[expense_col] = (
+        data[expense_col].astype(str)
+        .str.replace("\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+        .pipe(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+    )
+    grouped = data.groupby(sku_col)[expense_col].sum()
+    return {str(k): float(v) for k, v in grouped.items()}, ""
+
+def fetch_all_sku_promo_orders_report(token: str, date_from: str, date_to: str, timeout_s: int = 90) -> dict:
+    """
+    Best-effort: асинхронный отчёт CPO 'Оплата за заказ — все товары. Отчёт по заказам'.
+    Поток: GET .../all_sku_promo/orders/generate/json → UUID → поллинг статуса
+    GET /api/client/statistics/{UUID} до state OK/ERROR → скачивание
+    GET /api/client/statistics/report?UUID=...
+
+    ВАЖНО (честно про неопределённость): точная JSON-схема СТРОК этого конкретного
+    отчёта не задокументирована Ozon — в документации только человекочитаемые
+    названия колонок, без английских ключей. Парсинг ниже ищет колонку SKU/расход
+    по названию ключа гибко, а не по жёстко зашитым именам. Если формат окажется
+    другим — вернёт понятную ошибку с примером сырых данных, а не тихий ноль.
+    Надёжный запасной вариант — загрузка того же отчёта файлом (см. sidebar).
+    """
+    out = {"by_sku": {}, "total": 0.0, "error": "", "raw_sample": None}
+    headers = {"Authorization": f"Bearer {token}"}
+    tb_from, tb_to = f"{date_from}T00:00:00Z", f"{date_to}T23:59:59Z"
+    try:
+        gen = requests.get(
+            f"{PERFORMANCE_API_URL}/api/client/statistics/all_sku_promo/orders/generate/json",
+            params={"timeBounds.from": tb_from, "timeBounds.to": tb_to},
+            headers=headers, timeout=30,
+        )
+        if gen.status_code != 200:
+            out["error"] = f"generate вернул {gen.status_code}: {gen.text[:200]}"
+            return out
+        uuid = (gen.json() or {}).get("UUID")
+        if not uuid:
+            out["error"] = f"Нет UUID в ответе generate: {gen.text[:200]}"
+            return out
+
+        import time as _time
+        state = None
+        deadline = _time.time() + timeout_s
+        while _time.time() < deadline:
+            st_resp = requests.get(
+                f"{PERFORMANCE_API_URL}/api/client/statistics/{uuid}",
+                headers=headers, timeout=30,
+            )
+            if st_resp.status_code != 200:
+                _time.sleep(3)
+                continue
+            st_data = st_resp.json() or {}
+            state = st_data.get("state")
+            if state == "OK":
+                break
+            if state == "ERROR":
+                out["error"] = f"Ozon вернул ошибку формирования отчёта: {st_data.get('error')}"
+                return out
+            _time.sleep(3)
+        else:
+            out["error"] = f"Отчёт не сформировался за {timeout_s} сек (последний статус: {state})"
+            return out
+
+        rep = requests.get(
+            f"{PERFORMANCE_API_URL}/api/client/statistics/report",
+            params={"UUID": uuid}, headers=headers, timeout=60,
+        )
+        if rep.status_code != 200:
+            out["error"] = f"report вернул {rep.status_code}: {rep.text[:200]}"
+            return out
+
+        rows = None
+        try:
+            parsed = rep.json()
+            rows = parsed if isinstance(parsed, list) else (parsed.get("rows") or parsed.get("items"))
+        except Exception:
+            rows = None
+
+        if rows is None:
+            import csv, io
+            text = rep.text
+            delimiter = ";" if text.count(";") > text.count(",") else ","
+            all_rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+            if len(all_rows) < 2:
+                out["error"] = "Отчёт пуст или в неожиданном формате (не JSON и не похож на CSV)"
+                return out
+            header = [h.strip() for h in all_rows[0]]
+            rows = [dict(zip(header, r)) for r in all_rows[1:]]
+
+        if not rows:
+            out["error"] = ""   # пусто — значит расхода по CPO за период реально нет, это не ошибка
+            return out
+
+        out["raw_sample"] = rows[:3]
+        sample_keys = list(rows[0].keys()) if isinstance(rows[0], dict) else []
+        sku_key = next((k for k in sample_keys if str(k).strip().lower() == "sku"), None)
+        expense_key = next(
+            (k for k in sample_keys if any(t in str(k).lower() for t in ("expense", "расход", "spend"))),
+            None,
+        )
+        if sku_key is None or expense_key is None:
+            out["error"] = f"Не распознала колонки SKU/расход в ответе API. Ключи в строке: {sample_keys}"
+            return out
+
+        totals: dict[str, float] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sku = str(row.get(sku_key) or "").strip()
+            if not sku:
+                continue
+            try:
+                val = float(str(row.get(expense_key) or "0").replace(",", "."))
+            except Exception:
+                val = 0.0
+            totals[sku] = totals.get(sku, 0.0) + val
+        out["by_sku"] = totals
+        out["total"] = sum(totals.values())
+    except Exception as e:
+        out["error"] = f"{e}"
+    return out
+
 def fetch_performance_ad_spend(
     perf_client_id: str, perf_client_secret: str, date_from: str, date_to: str,
+    cpo_orders_file=None,
 ) -> dict:
     """
-    Полный цикл: токен → список CPC/CPO кампаний → расход по SKU за период.
-    Возвращает dict: by_sku, total, campaigns_used, campaigns_failed, error, fetched=True.
+    Полный цикл: токен → (CPC: список SKU-кампаний → statistics/products/sku) +
+    (CPO: файл пользователя ИЛИ best-effort async-отчёт all_sku_promo/orders) →
+    объединённый расход по SKU. CPC и CPO обрабатываются НЕЗАВИСИМО — если один
+    источник упал, второй всё равно применяется (см. cpc_ok/cpo_ok, используются
+    в основном скрипте, чтобы не потерять и не задвоить деньги в "Расходах магазина").
     """
     out = {
-        "by_sku": {}, "total": 0.0, "campaigns_used": 0,
-        "campaigns_failed": [], "error": None, "fetched": True,
+        "by_sku": {}, "total": 0.0, "fetched": True, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [],
+        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None,
     }
     try:
         token = get_performance_token(perf_client_id, perf_client_secret)
+    except Exception as e:
+        out["error"] = f"Не удалось получить токен Performance API: {e}"
+        return out
+
+    # ── CPC: SKU-кампании ("Трафареты", оплата за клик) ──────────────────────
+    cpc_by_sku: dict[str, float] = {}
+    try:
         campaigns = fetch_performance_campaigns(token)
         out["raw_campaigns_count"] = len(campaigns)
-        # Для диагностики — реальные значения полей, чтобы не гадать по (местами
-        # противоречивой) документации, если фильтр ниже вдруг снова ничего не найдёт.
         out["raw_campaigns_sample"] = [
             {
                 "id": c.get("id"), "title": c.get("title"),
                 "paymentType": c.get("paymentType"), "advObjectType": c.get("advObjectType"),
                 "state": c.get("state"),
             }
-            for c in campaigns[:20] if isinstance(c, dict)
+            for c in campaigns[:30] if isinstance(c, dict)
         ]
-
-        def _is_ad_campaign(c: dict) -> bool:
-            adv = str(c.get("advObjectType") or "").upper()
-            pay = str(c.get("paymentType") or "").upper()
-            if adv in PERFORMANCE_AD_OBJECT_TYPES:
-                return True
-            return any(t in pay for t in PERFORMANCE_AD_PAYMENT_TYPES)
-
-        ad_campaign_ids = [str(c.get("id")) for c in campaigns if isinstance(c, dict) and _is_ad_campaign(c)]
-
-        if not ad_campaign_ids:
-            if not campaigns:
-                out["error"] = (
-                    "Performance API вернул пустой список кампаний (0 штук) — похоже, у этой "
-                    "пары Client-ID/Secret нет доступа к рекламному кабинету. Проверь, что "
-                    "сервисный аккаунт создан с ролью, дающей доступ к Performance API, и что "
-                    "это тот же кабинет, где видна реклама в личном ЛК."
-                )
-            else:
-                out["error"] = (
-                    f"Получено {len(campaigns)} кампаний, но ни одна не распознана как CPC/CPO "
-                    f"по полям advObjectType/paymentType — см. «raw_campaigns_sample» в "
-                    f"диагностике (Tab5 → Performance API), там реальные значения этих полей."
-                )
-            return out
-        by_sku, failed = fetch_performance_sku_expense(token, ad_campaign_ids, date_from, date_to)
-        out["by_sku"] = by_sku
-        out["total"] = sum(by_sku.values())
-        out["campaigns_used"] = len(ad_campaign_ids) - len(failed)
-        out["campaigns_failed"] = failed
+        cpc_ids = [
+            str(c.get("id")) for c in campaigns
+            if isinstance(c, dict) and str(c.get("advObjectType") or "").upper() == "SKU"
+        ]
+        if cpc_ids:
+            cpc_by_sku, failed = fetch_performance_sku_expense(token, cpc_ids, date_from, date_to)
+            out["cpc_campaigns_used"] = len(cpc_ids) - len(failed)
+            out["cpc_campaigns_failed"] = failed
+            out["cpc_ok"] = len(failed) < len(cpc_ids)   # хоть одна кампания отдала данные
+        else:
+            out["cpc_ok"] = True   # CPC-кампаний в кабинете просто нет — это не ошибка
     except Exception as e:
-        out["error"] = f"{e}"
+        out["error"] = f"Ошибка получения CPC-статистики: {e}"
+    out["cpc_total"] = sum(cpc_by_sku.values())
+
+    # ── CPO: "Оплата за заказ — все товары" ───────────────────────────────────
+    cpo_by_sku: dict[str, float] = {}
+    if cpo_orders_file is not None:
+        cpo_by_sku, cpo_err = parse_all_sku_promo_orders_file(cpo_orders_file)
+        out["cpo_source"] = "file"
+        out["cpo_error"] = cpo_err
+        out["cpo_ok"] = not cpo_err
+    else:
+        cpo_result = fetch_all_sku_promo_orders_report(token, date_from, date_to)
+        cpo_by_sku = cpo_result.get("by_sku", {})
+        out["cpo_source"] = "api"
+        out["cpo_error"] = cpo_result.get("error") or ""
+        out["cpo_raw_sample"] = cpo_result.get("raw_sample")
+        out["cpo_ok"] = not out["cpo_error"]
+    out["cpo_total"] = sum(cpo_by_sku.values())
+
+    # ── Объединяем ─────────────────────────────────────────────────────────
+    combined: dict[str, float] = {}
+    for d in (cpc_by_sku, cpo_by_sku):
+        for k, v in d.items():
+            combined[k] = combined.get(k, 0.0) + v
+    out["by_sku"] = combined
+    out["total"] = sum(combined.values())
+
+    if not out["cpc_ok"] and not out["cpo_ok"] and not out["error"]:
+        out["error"] = "Не удалось получить данные ни по CPC, ни по CPO — см. диагностику (Tab5)."
     return out
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
@@ -1113,6 +1307,19 @@ with st.sidebar:
         help="Включено: сумма из Performance API ЗАМЕНЯЕТ статью «Реклама» (CPC/CPO) в «Расходах "
              "магазина» и распределяется по конкретным артикулам в таблице — без задвоения. "
              "Выключено: Performance API не запрашивается, всё как раньше (одна сумма на магазин)."
+    )
+
+    st.caption(
+        "«Оплата за заказ — все товары» (CPO) не отдаёт расход по SKU через тот же метод, "
+        "что и «Оплата за клик» — для неё нужен отдельный отчёт. Автоматический запрос "
+        "экспериментальный (схема ответа не полностью задокументирована у Ozon); если он не "
+        "сработает — загрузи файл ниже (тот самый, что скачиваешь в ЛК Ozon: Статистика → "
+        "Оплата за заказ, все товары → Отчёт по заказам)."
+    )
+    cpo_orders_file = st.file_uploader(
+        "Отчёт «Оплата за заказ — все товары» (xlsx/csv), опционально",
+        type=["xlsx", "csv"],
+        help="Если загружен — используется вместо автоматического API-запроса CPO (надёжнее)."
     )
 
     st.divider()
@@ -1271,9 +1478,10 @@ if "perf_ad_spend" not in st.session_state:
     st.session_state.perf_ad_spend = {}   # {sku: расход ₽} из Performance API
 if "perf_ad_meta" not in st.session_state:
     st.session_state.perf_ad_meta = {
-        "total": 0.0, "campaigns_used": 0, "campaigns_failed": [],
-        "error": None, "fetched": False,
+        "total": 0.0, "fetched": False, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [],
+        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None,
     }
 
 if demo_btn:
@@ -1332,9 +1540,10 @@ if load_btn:
         st.session_state.store_costs = {}
         st.session_state.perf_ad_spend = {}
         st.session_state.perf_ad_meta = {
-            "total": 0.0, "campaigns_used": 0, "campaigns_failed": [],
-            "error": None, "fetched": False,
+            "total": 0.0, "fetched": False, "error": None,
             "raw_campaigns_count": 0, "raw_campaigns_sample": [],
+            "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [],
+            "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None,
         }
         with st.spinner("Загружаем данные из Ozon API..."):
             try:
@@ -1422,37 +1631,57 @@ if load_btn:
                             perf_result = fetch_performance_ad_spend(
                                 perf_client_id, perf_client_secret,
                                 d_from.strftime("%Y-%m-%d"), d_to.strftime("%Y-%m-%d"),
+                                cpo_orders_file=cpo_orders_file,
                             )
                         st.session_state.perf_ad_spend = perf_result["by_sku"]
                         st.session_state.perf_ad_meta = perf_result
+
                         if perf_result["error"]:
                             st.warning(
                                 f"⚠️ Performance API: {perf_result['error']} — реклама по артикулам "
                                 f"не будет учтена в этой загрузке, «Расходы магазина» остаются как раньше "
                                 f"(одна сумма CPC/CPO на весь магазин из Seller API)."
                             )
-                            if perf_result.get("raw_campaigns_sample"):
-                                with st.expander(
-                                    f"🔍 Сырые кампании из Performance API "
-                                    f"(всего {perf_result.get('raw_campaigns_count', 0)}, показаны первые "
-                                    f"{len(perf_result['raw_campaigns_sample'])})",
-                                    expanded=True,
-                                ):
-                                    st.dataframe(
-                                        pd.DataFrame(perf_result["raw_campaigns_sample"]),
-                                        use_container_width=True, hide_index=True,
-                                    )
-                        elif perf_result["campaigns_failed"]:
-                            st.warning(
-                                f"⚠️ Performance API: не ответили {len(perf_result['campaigns_failed'])} "
-                                f"из {perf_result['campaigns_used'] + len(perf_result['campaigns_failed'])} "
-                                f"рекламных кампаний — расход на рекламу в этой загрузке может быть "
-                                f"немного занижен (не хватает данных по части кампаний)."
+                        else:
+                            st.success(
+                                f"🎯 Performance API: CPC {r(perf_result['cpc_total'])} "
+                                f"({'ок' if perf_result['cpc_ok'] else 'не удалось'}) + "
+                                f"CPO {r(perf_result['cpo_total'])} "
+                                f"({'ок, источник: ' + str(perf_result['cpo_source']) if perf_result['cpo_ok'] else 'не удалось'})"
                             )
+                        if not perf_result["cpc_ok"]:
+                            st.warning(
+                                f"⚠️ CPC (оплата за клик): не удалось получить статистику "
+                                f"({len(perf_result['cpc_campaigns_failed'])} кампаний с ошибкой) — "
+                                f"эта часть расхода останется в «Расходах магазина» одной суммой."
+                            )
+                        elif perf_result["cpc_campaigns_failed"]:
+                            st.warning(
+                                f"⚠️ CPC: не ответили {len(perf_result['cpc_campaigns_failed'])} из "
+                                f"{perf_result['cpc_campaigns_used'] + len(perf_result['cpc_campaigns_failed'])} "
+                                f"кампаний — расход может быть немного занижен."
+                            )
+                        if perf_result["cpo_error"]:
+                            st.warning(f"⚠️ CPO (оплата за заказ): {perf_result['cpo_error']}")
+
+                        if perf_result.get("raw_campaigns_sample") and (perf_result["error"] or not perf_result["cpc_ok"]):
+                            with st.expander(
+                                f"🔍 Сырые кампании из Performance API "
+                                f"(всего {perf_result.get('raw_campaigns_count', 0)}, показаны первые "
+                                f"{len(perf_result['raw_campaigns_sample'])})",
+                                expanded=True,
+                            ):
+                                st.dataframe(
+                                    pd.DataFrame(perf_result["raw_campaigns_sample"]),
+                                    use_container_width=True, hide_index=True,
+                                )
+                        if perf_result.get("cpo_raw_sample"):
+                            with st.expander("🔍 Сырой пример строк CPO-отчёта (для диагностики)", expanded=bool(perf_result["cpo_error"])):
+                                st.json(perf_result["cpo_raw_sample"])
 
                     _perf_map_for_profit = (
                         st.session_state.perf_ad_spend
-                        if (use_perf_ads and not st.session_state.perf_ad_meta.get("error"))
+                        if (use_perf_ads and st.session_state.perf_ad_spend)
                         else {}
                     )
                     # enrich_with_cost вызывается ПОСЛЕ обновления логистики
@@ -1514,16 +1743,18 @@ total_qty  = df["qty"].sum()
 # Расходы магазина нужны ДО метрик — чтобы показать реальную прибыль и правильную маржу
 _sc_kpi: dict = st.session_state.get("store_costs", {})
 _perf_meta_kpi: dict = st.session_state.get("perf_ad_meta", {}) or {}
-# Реклама CPC/CPO (type_id 41+54) заменяется на Performance API, только если: включена
-# галочка, запрос был выполнен и не завершился полной ошибкой (частичный сбой части
-# кампаний — не считается полной ошибкой, см. предупреждение при загрузке).
-_perf_replaces_store_ads = bool(
-    use_perf_ads and _perf_meta_kpi.get("fetched") and not _perf_meta_kpi.get("error")
-)
-if _perf_replaces_store_ads:
-    _sc_kpi_effective = {tid: amt for tid, amt in _sc_kpi.items() if tid not in PERFORMANCE_STORE_TYPE_IDS}
-else:
-    _sc_kpi_effective = _sc_kpi
+# Реклама CPC (type_id 41) и CPO (type_id 54) заменяются на Performance API НЕЗАВИСИМО
+# друг от друга — только тот из двух, который реально успешно получен (cpc_ok/cpo_ok).
+# Так расход не теряется, если один источник не сработал, а другой — сработал.
+_perf_replaces_cpc = bool(use_perf_ads and _perf_meta_kpi.get("fetched") and _perf_meta_kpi.get("cpc_ok"))
+_perf_replaces_cpo = bool(use_perf_ads and _perf_meta_kpi.get("fetched") and _perf_meta_kpi.get("cpo_ok"))
+_perf_replaces_store_ads = _perf_replaces_cpc or _perf_replaces_cpo   # хоть что-то заменено
+_excluded_store_type_ids = set()
+if _perf_replaces_cpc:
+    _excluded_store_type_ids.add(PERFORMANCE_CPC_STORE_TYPE_ID)
+if _perf_replaces_cpo:
+    _excluded_store_type_ids.add(PERFORMANCE_CPO_STORE_TYPE_ID)
+_sc_kpi_effective = {tid: amt for tid, amt in _sc_kpi.items() if tid not in _excluded_store_type_ids}
 _sc_total_kpi = sum(v for v in _sc_kpi_effective.values() if v < 0) if _sc_kpi_effective else 0
 
 # SKU, у которых был расход в Performance API, но не оказалось строки в df (например,
@@ -1576,11 +1807,17 @@ if store_costs or total_tax or _perf_unmatched:
         expanded=False,
     ):
         if _perf_replaces_store_ads:
+            _replaced_names = []
+            if _perf_replaces_cpc:
+                _replaced_names.append("CPC (оплата за клик, type 41)")
+            if _perf_replaces_cpo:
+                _replaced_names.append("CPO (оплата за заказ, type 54)")
             st.info(
-                "🎯 Реклама CPC/CPO теперь считается по Performance API и распределена по "
-                "артикулам (колонка «Реклама CPC/CPO» в таблице ниже) — вместо одной суммы "
-                "здесь. Type_id 41 и 54 из Seller API исключены из этого блока, чтобы не "
-                "задвоить расход."
+                f"🎯 Реклама {' и '.join(_replaced_names)} теперь считается по Performance API "
+                f"и распределена по артикулам (колонка «Реклама CPC/CPO» в таблице ниже) — "
+                f"вместо одной суммы здесь, чтобы не задвоить расход."
+                + ("" if _perf_replaces_cpc and _perf_replaces_cpo else
+                   " Вторая часть (не заменённая) пока остаётся здесь одной суммой, как раньше.")
             )
         sc_rows = []
         for tid, amt in sorted(store_costs.items(), key=lambda x: x[1]):
@@ -1625,22 +1862,33 @@ if store_costs or total_tax or _perf_unmatched:
         sa4.metric("Реальная прибыль", r(total_prof_adj),
                    delta_color="normal" if total_prof_adj >= 0 else "inverse")
 
-        if _perf_replaces_store_ads:
-            _old_ads_41_54 = abs(sum(v for k, v in _sc_kpi.items() if k in PERFORMANCE_STORE_TYPE_IDS))
-            _new_ads_perf = abs(float(_perf_meta_kpi.get("total", 0.0)))
+        if _perf_replaces_cpc:
+            _old_cpc = abs(_sc_kpi.get(PERFORMANCE_CPC_STORE_TYPE_ID, 0.0))
+            _new_cpc = abs(float(_perf_meta_kpi.get("cpc_total", 0.0)))
             st.caption(
-                f"🔍 Сверка рекламы CPC/CPO — Seller API (type 41+54, одна сумма на магазин, "
-                f"как считалось раньше) = **{r(_old_ads_41_54)}**; Performance API (сумма по "
-                f"всем SKU за тот же период, из чего сейчас считается P&L) = **{r(_new_ads_perf)}**; "
-                f"разница = **{r(abs(_old_ads_41_54 - _new_ads_perf))}**. Расхождение возможно "
-                f"из-за разницы в моделях учёта дат/списаний между Seller API и Performance API — "
-                f"если оно большое, стоит уточнить у поддержки Ozon, а не считать ошибкой кода."
+                f"🔍 Сверка CPC — Seller API (type 41, как считалось раньше) = **{r(_old_cpc)}**; "
+                f"Performance API (сумма по SKU, из чего сейчас считается P&L) = **{r(_new_cpc)}**; "
+                f"разница = **{r(abs(_old_cpc - _new_cpc))}**."
             )
-            if _perf_meta_kpi.get("campaigns_failed"):
+            if _perf_meta_kpi.get("cpc_campaigns_failed"):
                 st.warning(
-                    f"⚠️ {len(_perf_meta_kpi['campaigns_failed'])} кампаний Performance API не "
-                    f"ответили при этой загрузке — сумма выше может быть занижена."
+                    f"⚠️ {len(_perf_meta_kpi['cpc_campaigns_failed'])} CPC-кампаний не ответили "
+                    f"при этой загрузке — сумма CPC выше может быть занижена."
                 )
+        if _perf_replaces_cpo:
+            _old_cpo = abs(_sc_kpi.get(PERFORMANCE_CPO_STORE_TYPE_ID, 0.0))
+            _new_cpo = abs(float(_perf_meta_kpi.get("cpo_total", 0.0)))
+            st.caption(
+                f"🔍 Сверка CPO — Seller API (type 54, как считалось раньше) = **{r(_old_cpo)}**; "
+                f"Performance API (источник: {_perf_meta_kpi.get('cpo_source')}, из чего сейчас "
+                f"считается P&L) = **{r(_new_cpo)}**; разница = **{r(abs(_old_cpo - _new_cpo))}**."
+            )
+        if _perf_replaces_cpc or _perf_replaces_cpo:
+            st.caption(
+                "Расхождение возможно из-за разницы в моделях учёта дат/списаний между Seller "
+                "API и Performance API — если оно большое, стоит уточнить у поддержки Ozon, а "
+                "не считать ошибкой кода."
+            )
 
 st.divider()
 
@@ -2220,13 +2468,22 @@ with tab5:
             _perf_meta_diag = st.session_state.get("perf_ad_meta", {}) or {}
             _d5p1, _d5p2, _d5p3, _d5p4 = st.columns(4)
             _d5p1.metric("Реклама CPC/CPO (ads_perf) — сумма", f"{_fdf['ads_perf'].abs().sum():,.0f} ₽".replace(",", " ") if "ads_perf" in _fdf.columns else "нет колонки")
-            _d5p2.metric("Найдено SKU с расходом", str(len(_perf_meta_diag.get("by_sku", st.session_state.get("perf_ad_spend", {})))))
-            _d5p3.metric("Кампаний использовано", str(_perf_meta_diag.get("campaigns_used", 0)))
-            _d5p4.metric("Кампаний с ошибкой", str(len(_perf_meta_diag.get("campaigns_failed", []))))
+            _d5p2.metric("Найдено SKU с расходом", str(len(_perf_meta_diag.get("by_sku", {}))))
+            _d5p3.metric("CPC: сумма / кампаний", f"{_perf_meta_diag.get('cpc_total', 0):,.0f} ₽ / {_perf_meta_diag.get('cpc_campaigns_used', 0)}".replace(",", " "))
+            _d5p4.metric("CPO: сумма / источник", f"{_perf_meta_diag.get('cpo_total', 0):,.0f} ₽ / {_perf_meta_diag.get('cpo_source') or '—'}".replace(",", " "))
             if _perf_meta_diag.get("error"):
                 st.error(f"Ошибка Performance API при последней загрузке: {_perf_meta_diag['error']}")
             elif not _perf_meta_diag.get("fetched"):
                 st.info("Performance API не запрашивался — не заполнены Performance Client-ID/Secret в боковом меню.")
+            else:
+                st.caption(
+                    f"CPC: {'ок' if _perf_meta_diag.get('cpc_ok') else '⚠️ не удалось'} "
+                    f"({_perf_meta_diag.get('cpc_campaigns_used', 0)} кампаний использовано, "
+                    f"{len(_perf_meta_diag.get('cpc_campaigns_failed', []))} с ошибкой). "
+                    f"CPO: {'ок' if _perf_meta_diag.get('cpo_ok') else '⚠️ не удалось'} "
+                    f"(источник: {_perf_meta_diag.get('cpo_source') or '—'})."
+                    + (f" Ошибка CPO: {_perf_meta_diag['cpo_error']}" if _perf_meta_diag.get('cpo_error') else "")
+                )
             if _perf_meta_diag.get("raw_campaigns_sample"):
                 st.caption(
                     f"Сырые кампании из GET /api/client/campaign (всего "
@@ -2238,6 +2495,9 @@ with tab5:
                     pd.DataFrame(_perf_meta_diag["raw_campaigns_sample"]),
                     use_container_width=True, hide_index=True,
                 )
+            if _perf_meta_diag.get("cpo_raw_sample"):
+                st.caption("Сырой пример строк CPO-отчёта (для диагностики схемы ответа API):")
+                st.json(_perf_meta_diag["cpo_raw_sample"])
         else:
             st.warning("df ещё не загружен — сначала нажмите «Загрузить данные»")
 
