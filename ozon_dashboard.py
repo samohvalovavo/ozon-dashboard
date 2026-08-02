@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 13:29"
+APP_BUILD_VERSION = "02.08.2026 13:34"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -1176,11 +1176,18 @@ def fetch_all_sku_promo_orders_report(token: str, date_from: str, date_to: str, 
 
         out["raw_sample"] = rows[:3]
         sample_keys = list(rows[0].keys()) if isinstance(rows[0], dict) else []
+        # Подтверждено на реальном ответе API 02.08.2026: ключи date, order_id, order_number,
+        # sku, adv_sku, vendor_code, name, quantity, price, sale_price, bid, abs_bid,
+        # adv_money_spent. Берём "sku" (что реально куплено), НЕ "adv_sku" (что продвигалось —
+        # может отличаться при кросс-показах), и "adv_money_spent" — это и есть расход, ₽.
+        # Оставляем гибкий fallback на случай, если Ozon переименует поля в будущем.
         sku_key = next((k for k in sample_keys if str(k).strip().lower() == "sku"), None)
-        expense_key = next(
-            (k for k in sample_keys if any(t in str(k).lower() for t in ("expense", "расход", "spend"))),
-            None,
-        )
+        expense_key = next((k for k in sample_keys if str(k).strip().lower() == "adv_money_spent"), None)
+        if expense_key is None:
+            expense_key = next(
+                (k for k in sample_keys if any(t in str(k).lower() for t in ("expense", "расход", "spend", "spent"))),
+                None,
+            )
         if sku_key is None or expense_key is None:
             out["error"] = f"Не распознала колонки SKU/расход в ответе API. Ключи в строке: {sample_keys}"
             return out
