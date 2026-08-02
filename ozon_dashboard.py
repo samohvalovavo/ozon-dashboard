@@ -295,10 +295,14 @@ def fetch_transactions(client_id: str, api_key: str, date_from: str, date_to: st
     return all_accruals
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
+def _fetch_accrual_types_raw(client_id: str, api_key: str) -> dict[int, str]:
     """
-    /v1/finance/accrual/types — справочник всех type_id с названиями.
-    Возвращает {type_id: название}.
+    /v1/finance/accrual/types — справочник всех type_id с АНГЛИЙСКИМИ названиями (сырые,
+    без перевода). Кэшируется на сутки — сам список типов у Ozon меняется редко.
+    Перевод НЕ делаем здесь специально: если исправить опечатку/неверный перевод в
+    _ACCRUAL_EN_TO_RU, это должно применяться сразу, без риска словить старый закэшированный
+    результат перевода (найдено 02.08.2026 — «Placements» показывал старый неверный перевод
+    даже после фикса словаря, пока перевод был закэширован вместе с самим fetch).
     """
     data = api_post("/v1/finance/accrual/types", {}, client_id, api_key)
     result = {}
@@ -308,8 +312,17 @@ def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
         tid = t.get("accrual_id") or t.get("type_id") or t.get("id")
         name = t.get("name") or t.get("title") or t.get("description")
         if tid is not None and name:
-            result[int(tid)] = _ACCRUAL_EN_TO_RU.get(name, name)
+            result[int(tid)] = str(name)
     return result
+
+def fetch_accrual_types(client_id: str, api_key: str) -> dict[int, str]:
+    """
+    /v1/finance/accrual/types — справочник type_id → русское название.
+    Сырой список (англ.) кэшируется на сутки, а перевод через _ACCRUAL_EN_TO_RU
+    применяется КАЖДЫЙ РАЗ заново (не кэшируется) — см. docstring _fetch_accrual_types_raw.
+    """
+    raw = _fetch_accrual_types_raw(client_id, api_key)
+    return {tid: _ACCRUAL_EN_TO_RU.get(name, name) for tid, name in raw.items()}
 
 # Модульный (процесс-wide) таймер последнего запроса к /v1/analytics/turnover/stocks.
 # ВАЖНО: лимит 1 запрос/мин — на весь Client-Id, а не на один вызов fetch_offer_ids_by_sku().
@@ -358,14 +371,46 @@ def fetch_offer_ids_by_sku(client_id: str, api_key: str, skus: tuple) -> dict:
     # доматчить оставшиеся SKU через /v1/product/info — из-за этого часть артикулов
     # отображалась как «сырой» числовой SKU вместо реального артикула. Исправлено 02.08.2026:
     # теперь для всех SKU, которых не нашлось в turnover/stocks, всегда идём в fallback.
+    def _call_turnover_stocks(batch: list[str]) -> dict:
+        """
+        Вызов turnover/stocks с РЕАКТИВНЫМ ожиданием на случай, если проактивный
+        cooldown (_wait_turnover_stocks_cooldown) всё равно не спас от 429 — например,
+        если лимит Ozon считается не «60 сек с момента последнего успешного запроса»,
+        а как-то иначе (скользящее окно, штраф за серию предыдущих 429 и т.п. — это
+        не подтверждено документацией, поэтому подстраховываемся). В отличие от общего
+        api_post() (короткий backoff до ~7.5 сек, бесполезный для лимита 1/мин), здесь
+        при 429 ждём честную минуту и пробуем ещё раз — до 2 попыток всего.
+        """
+        import time as _t
+        headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
+        body = {"sku": batch, "limit": len(batch), "offset": 0}
+        for attempt in range(2):
+            _wait_turnover_stocks_cooldown()
+            try:
+                resp = requests.post(API_URL + "/v1/analytics/turnover/stocks",
+                                      json=body, headers=headers, timeout=30)
+            except Exception:
+                return {}
+            if resp.status_code == 429:
+                if attempt == 0:
+                    st.info("Ozon всё ещё отвечает 429 на turnover/stocks — ждём полную минуту и пробуем ещё раз…")
+                    _t.sleep(65)
+                    continue
+                st.warning(
+                    "turnover/stocks недоступен из-за лимита запросов после повторной попытки — "
+                    "часть артикулов будет доматчена через запасные методы (могут занять дольше)."
+                )
+                return {}
+            if resp.status_code != 200:
+                return {}
+            return resp.json()
+        return {}
+
     sku_strings = [str(s) for s in skus]
     try:
         for i in range(0, len(sku_strings), 1000):
             batch = sku_strings[i:i+1000]
-            _wait_turnover_stocks_cooldown()  # ждёт, если нужно, ПЕРЕД КАЖДЫМ запросом к этому методу
-            data = api_post("/v1/analytics/turnover/stocks",
-                            {"sku": batch, "limit": len(batch), "offset": 0},
-                            client_id, api_key)
+            data = _call_turnover_stocks(batch)
             if not data:
                 continue
             for item in (data.get("items") or []):
