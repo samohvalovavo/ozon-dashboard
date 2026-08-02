@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 13:40"
+APP_BUILD_VERSION = "02.08.2026 13:49"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -908,7 +908,14 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict, cpc_ad_map: dict = None, 
 
     df = df.copy()
     df["cost_price"] = df["article"].map(cost_map).fillna(0)
-    df["cost_total"] = df["cost_price"] * df["qty"]
+    # Себестоимость считаем НЕТТО: проданные минус возвращённые в том же периоде штуки
+    # (решение пользователя, 02.08.2026) — возвращённый товар приходит обратно целым, его
+    # себестоимость не списывается в убыток. qty_ret может отсутствовать (demo-данные) —
+    # тогда просто 0, поведение не меняется.
+    if "qty_ret" not in df.columns:
+        df["qty_ret"] = 0
+    df["qty_net"] = df["qty"] - df["qty_ret"]
+    df["cost_total"] = df["cost_price"] * df["qty_net"]
     # Если эквайринг пришёл из API (транзакции) — используем его; иначе расчётный %
     if "acquiring" not in df.columns or df["acquiring"].abs().sum() == 0:
         df["acquiring"] = ACQUIRING * df["revenue"]
@@ -1905,7 +1912,7 @@ st.divider()
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 По артикулам", "📦 Остатки", "📈 Диаграммы", "🔢 Калькулятор", "🔍 Детализация"])
 
 with tab1:
-    show_cols = ["article", "name", "qty", "revenue", "partner_programs", "bonus_points", "cost_total",
+    show_cols = ["article", "name", "qty", "qty_ret", "revenue", "partner_programs", "bonus_points", "cost_total",
                  "commission", "acquiring", "tax", "logistics", "promo", "ads_cpc", "ads_cpo", "installment", "other_costs", "profit", "margin_pct"]
     available = [c for c in show_cols if c in df.columns]
     display_df = df[available].copy()
@@ -1914,6 +1921,7 @@ with tab1:
         "article": "Артикул",
         "name": "Товар",
         "qty": "Продано",
+        "qty_ret": "Возвращено",
         "revenue": "Выручка",
         "partner_programs": "Программы партнёров",
         "bonus_points": "Баллы за скидки",
@@ -2023,6 +2031,7 @@ with tab1:
             "article":     "Артикул",
             "name":        "Товар",
             "qty":         "Продано шт",
+            "qty_ret":     "Возвращено шт",
             "revenue":     "Выручка",
             "partner_programs": "Программы партнёров",
             "bonus_points":     "Баллы за скидки",
