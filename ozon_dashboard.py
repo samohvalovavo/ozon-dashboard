@@ -10,6 +10,11 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 import calendar
 
+# Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
+# см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
+# на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
+APP_BUILD_VERSION = "02.08.2026 12:35"
+
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Ozon P&L",
@@ -925,6 +930,7 @@ def enrich_with_cost(df: pd.DataFrame, cost_map: dict) -> pd.DataFrame:
 with st.sidebar:
     st.title("⬡ Ozon P&L")
     st.caption("Дашборд юнит-экономики")
+    st.caption(f"⚙️ Версия от {APP_BUILD_VERSION}")
 
     st.divider()
     st.subheader("🔑 API-доступ")
