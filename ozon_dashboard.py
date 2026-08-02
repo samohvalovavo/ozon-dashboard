@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 13:49"
+APP_BUILD_VERSION = "02.08.2026 14:42"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -1908,10 +1908,13 @@ if store_costs or total_tax or _perf_unmatched:
 
 st.divider()
 
-# ── Таблица по артикулам ───────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 По артикулам", "📦 Остатки", "📈 Диаграммы", "🔢 Калькулятор", "🔍 Детализация"])
-
-with tab1:
+# ── Страницы (левая навигация, st.navigation) ────────────────────────────────
+# Раньше здесь были st.tabs() с 5 вкладками (включая Диаграммы и Калькулятор — оба
+# убраны по просьбе пользователя 02.08.2026). Функции ниже читают общие переменные
+# (df, total_rev, days, client_id, api_key, sku_map_cache, raw_ops и т.д.) как обычные
+# глобальные — они уже вычислены выше по скрипту к моменту вызова pg.run() в самом
+# конце файла, поэтому доступны без явной передачи параметров.
+def page_articles():
     show_cols = ["article", "name", "qty", "qty_ret", "revenue", "partner_programs", "bonus_points", "cost_total",
                  "commission", "acquiring", "tax", "logistics", "promo", "ads_cpc", "ads_cpo", "installment", "other_costs", "profit", "margin_pct"]
     available = [c for c in show_cols if c in df.columns]
@@ -2160,7 +2163,7 @@ with tab1:
             "**Продано (финанс.)** — продажи с зачисленной выручкой (могут не совпадать из-за задержки начислений)."
         )
 
-with tab2:
+def page_stocks():
     # ── Остатки и оборачиваемость ──────────────────────────────────────────────
     st.subheader("📦 Остатки и оборачиваемость")
     stocks_data = st.session_state.get("stocks_data", [])
@@ -2285,94 +2288,7 @@ with tab2:
             mime="application/vnd.ms-excel",
         )
 
-with tab3:
-    if total_rev > 0:
-        # Структура расходов (pie)
-        st.subheader("Структура выручки")
-        breakdown = {
-            "Прибыль": max(0, total_prof),
-            "Себестоимость": total_cost,
-            "Комиссия": total_comm,
-            "Логистика": total_log,
-            "Налог": df["tax"].sum() if "tax" in df.columns else 0,
-            "Эквайринг": df["acquiring"].sum() if "acquiring" in df.columns else 0,
-            "Реклама":   df["promo"].abs().sum()       if "promo"       in df.columns else 0,
-            "Рассрочка": df["installment"].abs().sum() if "installment" in df.columns else 0,
-        }
-        pie_df = pd.DataFrame({
-            "Статья": list(breakdown.keys()),
-            "Сумма": list(breakdown.values()),
-        })
-        st.bar_chart(pie_df.set_index("Статья"), horizontal=True)
-
-        # Топ по прибыли
-        st.subheader("Топ артикулов по прибыли")
-        top = df.nlargest(10, "profit")[["name", "profit", "margin_pct"]].set_index("name")
-        st.bar_chart(top["profit"])
-
-with tab4:
-    st.subheader("🔢 Калькулятор юнит-экономики")
-    st.caption("Считает маржу по правильной формуле с учётом типа доставки")
-
-    col_l, col_r = st.columns([1, 1])
-
-    with col_l:
-        c_price = st.number_input("Цена продажи, ₽", value=3251, step=50)
-        c_cost = st.number_input("Себестоимость, ₽", value=1204, step=50)
-        c_comm = st.number_input("Комиссия Ozon, %", value=45, step=1, min_value=0, max_value=100)
-        c_log = st.number_input("Логистика FBO, ₽", value=289, step=10)
-        c_qty = st.number_input("Количество в заказе", value=1, step=1, min_value=1)
-        c_mode = st.selectbox("Тип доставки", ["Экспресс (realFBS)", "FBS", "FBO"])
-
-    revenue = c_price * c_qty
-    cost_t = c_cost * c_qty
-    commission = (c_comm / 100) * revenue
-    acquiring = ACQUIRING * revenue
-    tax = TAX * revenue
-
-    if "Экспресс" in c_mode:
-        logistics = express_cost(revenue)
-        agent = AGENT_FEE
-    elif c_mode == "FBS":
-        logistics = c_log * c_qty
-        agent = 25
-    else:  # FBO
-        logistics = c_log * c_qty
-        agent = 0
-
-    total_exp = commission + acquiring + tax + logistics + agent
-    profit = revenue - cost_t - total_exp
-    margin = (profit / revenue * 100) if revenue else 0
-
-    with col_r:
-        color = "green" if margin >= 5 else ("orange" if margin >= 0 else "red")
-        st.markdown(f"### Маржа: :{color}[{ru_pct(margin)}]")
-        st.markdown(f"### Прибыль: :{color}[{r(profit)}]")
-
-        st.markdown("---")
-        breakdown_calc = {
-            "Выручка": revenue,
-            "− Себестоимость": -cost_t,
-            f"− Комиссия {c_comm}%": -commission,
-            f"− Эквайринг {ru_pct(ACQUIRING*100)}": -acquiring,
-            "− Налог УСН 7%": -tax,
-            f"− {'Экспресс' if 'Экспресс' in c_mode else 'Логистика'}": -logistics,
-        }
-        if agent:
-            breakdown_calc["− Агентское / посл.миля"] = -agent
-
-        breakdown_calc["= ПРИБЫЛЬ"] = profit
-
-        for label, val in breakdown_calc.items():
-            col_a, col_b = st.columns([3, 1])
-            col_a.write(label)
-            col_b.write(f"**{r(val)}**")
-
-        if "Экспресс" in c_mode:
-            st.info(f"Экспресс-тариф: заказ {r(revenue)} → **{logistics:.0f} ₽**\n\n"
-                    "до 2 000 → 300 · до 4 000 → 400 · до 7 500 → 500 · до 20 000 → 600 · от 20 000 → 800")
-
-with tab5:
+def page_details():
     st.subheader("🔍 Детализация по заказам")
 
     raw_ops = st.session_state.get("raw_ops", [])
@@ -2827,3 +2743,13 @@ with tab5:
                 use_container_width=True, hide_index=True,
                 height=400,
             )
+
+# ── Навигация (левое меню, как в стороннем сервисе) ──────────────────────────
+# Диаграммы и Калькулятор убраны по просьбе пользователя (02.08.2026) — раньше были
+# отдельными вкладками st.tabs(), больше нигде не используются.
+pg = st.navigation([
+    st.Page(page_articles, title="По артикулам", icon="📋", default=True),
+    st.Page(page_stocks,   title="Остатки",      icon="📦"),
+    st.Page(page_details,  title="Детализация",  icon="🔍"),
+])
+pg.run()
