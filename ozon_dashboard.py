@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 14:54"
+APP_BUILD_VERSION = "03.08.2026 21:36"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -201,6 +201,18 @@ def collect_store_costs(ops: list[dict]) -> dict[int, float]:
 
 # ── Ozon API ────────────────────────────────────────────────────────────────
 API_URL = "https://api-seller.ozon.ru"
+
+def _secret(key: str, default: str = "") -> str:
+    """
+    Читает значение из Secrets приложения (Manage app → Settings → Secrets на
+    Streamlit Cloud), если оно там задано — чтобы не вводить API-ключи заново
+    при каждом открытии. Если Secrets не настроены — просто пусто, поля в
+    сайдбаре остаются обычными пустыми text_input, как раньше.
+    """
+    try:
+        return str(st.secrets.get(key, default))
+    except Exception:
+        return default
 
 def api_post(endpoint: str, body: dict, client_id: str, api_key: str, _retries: int = 4) -> dict:
     """
@@ -1307,17 +1319,27 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🔑 API-доступ")
-    client_id = st.text_input("Client-ID", placeholder="123456", help="Seller API: seller.ozon.ru → Настройки → API-ключи")
-    api_key = st.text_input("API-Key", type="password", placeholder="xxxx-xxxx-xxxx")
+    client_id = st.text_input(
+        "Client-ID", value=_secret("OZON_CLIENT_ID"), placeholder="123456",
+        help="Seller API: seller.ozon.ru → Настройки → API-ключи. Чтобы не вводить каждый раз — "
+             "добавь ключи в Secrets приложения (⋮ внизу справа → Manage app → Settings → Secrets): "
+             "OZON_CLIENT_ID, OZON_API_KEY, OZON_PERF_CLIENT_ID, OZON_PERF_CLIENT_SECRET — тогда "
+             "поля заполнятся сами."
+    )
+    api_key = st.text_input("API-Key", value=_secret("OZON_API_KEY"), type="password", placeholder="xxxx-xxxx-xxxx")
 
     with st.expander("🎯 Реклама по артикулам (Performance API)"):
         perf_client_id = st.text_input(
-            "Performance Client-ID", placeholder="123@advertising.performance.ozon.ru",
+            "Performance Client-ID", value=_secret("OZON_PERF_CLIENT_ID"),
+            placeholder="123@advertising.performance.ozon.ru",
             help="Отдельная пара ключей от Seller API выше — Настройки → API-ключи → сервисный "
                  "аккаунт с доступом к Performance API. Даёт расход на рекламу (CPC/CPO) по каждому "
                  "артикулу вместо одной суммы на весь магазин."
         )
-        perf_client_secret = st.text_input("Performance Client-Secret", type="password", placeholder="xxxx-xxxx-xxxx")
+        perf_client_secret = st.text_input(
+            "Performance Client-Secret", value=_secret("OZON_PERF_CLIENT_SECRET"),
+            type="password", placeholder="xxxx-xxxx-xxxx",
+        )
         use_perf_ads = st.checkbox(
             "Учитывать в прибыли по артикулам", value=True,
             help="Вкл: сумма из Performance API ЗАМЕНЯЕТ статью «Реклама» (CPC/CPO) в «Расходах "
