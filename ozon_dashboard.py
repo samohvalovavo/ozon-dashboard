@@ -13,7 +13,7 @@ import calendar
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "02.08.2026 14:42"
+APP_BUILD_VERSION = "02.08.2026 14:54"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -1307,37 +1307,30 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🔑 API-доступ")
-    client_id = st.text_input("Client-ID", placeholder="123456")
+    client_id = st.text_input("Client-ID", placeholder="123456", help="Seller API: seller.ozon.ru → Настройки → API-ключи")
     api_key = st.text_input("API-Key", type="password", placeholder="xxxx-xxxx-xxxx")
 
-    st.divider()
-    st.subheader("🎯 Реклама (Performance API)")
-    st.caption(
-        "Опционально. Отдельные ключи — Настройки → API-ключи → сервисный аккаунт "
-        "с доступом к Performance API (client_id вида `123@advertising.performance.ozon.ru`). "
-        "Даёт расход на рекламу (CPC/CPO) по каждому артикулу, а не одной суммой на весь магазин."
-    )
-    perf_client_id = st.text_input("Performance Client-ID", placeholder="123@advertising.performance.ozon.ru")
-    perf_client_secret = st.text_input("Performance Client-Secret", type="password", placeholder="xxxx-xxxx-xxxx")
-    use_perf_ads = st.checkbox(
-        "Учитывать в прибыли по артикулам", value=True,
-        help="Включено: сумма из Performance API ЗАМЕНЯЕТ статью «Реклама» (CPC/CPO) в «Расходах "
-             "магазина» и распределяется по конкретным артикулам в таблице — без задвоения. "
-             "Выключено: Performance API не запрашивается, всё как раньше (одна сумма на магазин)."
-    )
-
-    st.caption(
-        "«Оплата за заказ — все товары» (CPO) не отдаёт расход по SKU через тот же метод, "
-        "что и «Оплата за клик» — для неё нужен отдельный отчёт. Автоматический запрос "
-        "экспериментальный (схема ответа не полностью задокументирована у Ozon); если он не "
-        "сработает — загрузи файл ниже (тот самый, что скачиваешь в ЛК Ozon: Статистика → "
-        "Оплата за заказ, все товары → Отчёт по заказам)."
-    )
-    cpo_orders_file = st.file_uploader(
-        "Отчёт «Оплата за заказ — все товары» (xlsx/csv), опционально",
-        type=["xlsx", "csv"],
-        help="Если загружен — используется вместо автоматического API-запроса CPO (надёжнее)."
-    )
+    with st.expander("🎯 Реклама по артикулам (Performance API)"):
+        perf_client_id = st.text_input(
+            "Performance Client-ID", placeholder="123@advertising.performance.ozon.ru",
+            help="Отдельная пара ключей от Seller API выше — Настройки → API-ключи → сервисный "
+                 "аккаунт с доступом к Performance API. Даёт расход на рекламу (CPC/CPO) по каждому "
+                 "артикулу вместо одной суммы на весь магазин."
+        )
+        perf_client_secret = st.text_input("Performance Client-Secret", type="password", placeholder="xxxx-xxxx-xxxx")
+        use_perf_ads = st.checkbox(
+            "Учитывать в прибыли по артикулам", value=True,
+            help="Вкл: сумма из Performance API ЗАМЕНЯЕТ статью «Реклама» (CPC/CPO) в «Расходах "
+                 "магазина» и распределяется по артикулам — без задвоения. Выкл: как раньше, "
+                 "одной суммой на магазин."
+        )
+        cpo_orders_file = st.file_uploader(
+            "Отчёт «Оплата за заказ» (xlsx/csv)", type=["xlsx", "csv"],
+            help="Нужен, только если авто-запрос CPO не сработает («Оплата за заказ» отдаёт расход "
+                 "по SKU не через тот же метод, что «Оплата за клик», и авто-запрос экспериментальный). "
+                 "Скачивается в ЛК Ozon: Статистика → Оплата за заказ, все товары → Отчёт по заказам. "
+                 "Если файл загружен — используется вместо API."
+        )
 
     st.divider()
     st.subheader("📅 Период")
