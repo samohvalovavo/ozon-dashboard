@@ -10,10 +10,20 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 import calendar
 
+# streamlit-aggrid — для страницы «P&L» с раскрывающимися группами столбцов (Task #20).
+# Импорт "мягкий": если пакет ещё не подхватился на Streamlit Cloud (requirements.txt
+# обновлён, но деплой не прогнан) — страница «P&L» покажет обычную таблицу без групп
+# столбцов вместо падения всего приложения.
+try:
+    from st_aggrid import AgGrid, JsCode
+    _AGGRID_AVAILABLE = True
+except Exception:
+    _AGGRID_AVAILABLE = False
+
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "03.08.2026 21:36"
+APP_BUILD_VERSION = "03.08.2026 22:47"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -197,6 +207,29 @@ def collect_store_costs(ops: list[dict]) -> dict[int, float]:
             continue
         amt = float(((nif.get("accrued") or {}).get("amount") or 0))
         totals[tid] = totals.get(tid, 0) + amt
+    return totals
+
+def collect_store_costs_daily(ops: list[dict]) -> dict[str, dict[int, float]]:
+    """
+    То же, что collect_store_costs, но с разбивкой по дням (accrual["_date"]) —
+    нужно для страницы «P&L» (Task #20), чтобы распределить расходы магазина
+    (подписки/реклама-магазин/FBO/партнёры/штрафы) по неделям/месяцам, а не
+    показывать одной суммой за весь период, как раньше в блоке «Расходы магазина».
+    """
+    totals: dict[str, dict[int, float]] = {}
+    for accrual in ops:
+        if not isinstance(accrual, dict):
+            continue
+        nif = accrual.get("non_item_fee")
+        if not isinstance(nif, dict):
+            continue
+        tid = _get_type_id(nif)
+        if tid is None:
+            continue
+        d = accrual.get("_date", "")
+        amt = float(((nif.get("accrued") or {}).get("amount") or 0))
+        totals.setdefault(d, {})
+        totals[d][tid] = totals[d].get(tid, 0) + amt
     return totals
 
 # ── Ozon API ────────────────────────────────────────────────────────────────
@@ -681,9 +714,14 @@ def fetch_name_map(client_id: str, api_key: str) -> dict:
             
     return name_map
 
-def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
+def _build_transaction_rows(ops: list[dict]) -> pd.DataFrame:
     """
-    Разбираем ответ /v1/finance/accrual/by-day.
+    Общий разбор ответа /v1/finance/accrual/by-day в "плоские" строки — ОДНА строка
+    на каждый product (POSTING) или каждый sku_fees.fee (ITEM), с колонкой "date"
+    (день начисления, accrual["_date"]). Не группирует — группировку делают вызывающие
+    функции (transactions_to_df — по sku/article, transactions_to_daily_pnl — по дате).
+    Вынесено в отдельную функцию 03.08.2026, чтобы не дублировать парсинг JSON в двух
+    местах и не рассинхронизировать логику при будущих фиксах полей.
     """
     if not ops:
         return pd.DataFrame()
@@ -694,7 +732,6 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
             continue
 
         date_str = accrual.get("_date", "")
-        category = accrual.get("accrued_category", "")
 
         # ── POSTING: продажи/возвраты с выручкой и комиссией ──────────────────
         posting = accrual.get("posting") or {}
@@ -749,6 +786,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
             is_sale = not is_return and gross_val != 0
 
             rows.append({
+                "date": date_str,
                 "sku": sku,
                 "article": offer_id_direct if offer_id_direct else sku,  # offer_id приоритетнее SKU
                 "name": "",
@@ -782,6 +820,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
                 amount = float((fee.get("accrued") or {}).get("amount") or 0)
                 known = {ACQUIRING_TYPE_ID, INSTALLMENT_TYPE_ID} | PROMO_TYPE_IDS
                 rows.append({
+                    "date": date_str,
                     "sku": sku, "article": offer_id_fees if offer_id_fees else sku, "name": "",
                     "qty": 0, "qty_ret": 0, "sale": 0, "return": 0,
                     "partner_programs": 0.0, "bonus_points": 0.0,
@@ -799,6 +838,16 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
     for col in ["qty", "qty_ret", "sale", "return", "partner_programs", "bonus_points",
                 "commission", "logistics", "acquiring", "promo", "installment", "other_costs"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
+    """
+    Разбираем ответ /v1/finance/accrual/by-day, группируем по артикулу (sku, article) —
+    для таблицы «По артикулам» за весь выбранный период одной строкой на товар.
+    """
+    df = _build_transaction_rows(ops)
+    if df.empty:
+        return df
 
     grouped = df.groupby(["sku", "article"]).agg(
         name=("name", "first"),
@@ -818,6 +867,225 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
 
     grouped["revenue"] = grouped["sale"] + grouped["return_sum"]
     return grouped
+
+def transactions_to_daily_pnl(
+    ops: list[dict], cost_map: dict,
+    cpc_by_date: dict = None, cpo_by_date: dict = None,
+) -> pd.DataFrame:
+    """
+    P&L по ДНЯМ (а не по артикулам) — для страницы «P&L» и для сохранения истории.
+    Группирует по (date, sku, article), применяет себестоимость (нетто по qty_ret,
+    как в enrich_with_cost) и рекламу CPC/CPO по дню+SKU (Performance API отдаёт дату
+    в каждой строке — см. fetch_performance_sku_expense/fetch_all_sku_promo_orders_report),
+    затем сворачивает до одной строки на календарный день.
+
+    Считается ПОСЛЕ применения sku_map (article уже должен быть настоящим офер_id,
+    не сырым числовым SKU) — передавай ops туда же, откуда взят df для transactions_to_df,
+    но article в _build_transaction_rows берётся из самого accrual (offer_id), а не из
+    sku_map, так что для товаров без offer_id в API артикул останется числовым SKU —
+    это ожидаемо и не мешает суммам, только отображению в будущей детализации по товару.
+    """
+    fine = _build_transaction_rows(ops)
+    if fine.empty:
+        return fine
+
+    fine["cost_price"] = fine["article"].map(cost_map).fillna(0)
+    fine["qty_net"] = fine["qty"] - fine["qty_ret"]
+    fine["cost_total"] = fine["cost_price"] * fine["qty_net"]
+
+    cpc_by_date = cpc_by_date or {}
+    cpo_by_date = cpo_by_date or {}
+
+    daily = fine.groupby("date").agg(
+        qty=("qty", "sum"),
+        qty_ret=("qty_ret", "sum"),
+        sale=("sale", "sum"),
+        return_sum=("return", "sum"),
+        partner_programs=("partner_programs", "sum"),
+        bonus_points=("bonus_points", "sum"),
+        commission=("commission", "sum"),
+        logistics=("logistics", "sum"),
+        acquiring=("acquiring", "sum"),
+        promo=("promo", "sum"),
+        installment=("installment", "sum"),
+        other_costs=("other_costs", "sum"),
+        cost_total=("cost_total", "sum"),
+    ).reset_index()
+
+    # Реклама по дням: считаем ОДИН РАЗ на уникальную пару (дата, SKU) из by_date-словарей
+    # Performance API — НЕ по "плоским" строкам fine (там один и тот же SKU за один день
+    # встречается по нескольку раз: отдельная строка от POSTING + отдельная от каждого
+    # ITEM-сбора типа эквайринг/промо, иначе реклама задвоится/учетверится на каждую
+    # такую строку). Заодно учитываем SKU без продаж в этот день (показы/клики без
+    # покупки) — их расход всё равно суммируется в тот же день, деньги не теряются.
+    def _daily_ads_totals(by_date: dict) -> dict:
+        totals: dict[str, float] = {}
+        for d, sku_map_ in by_date.items():
+            totals[d] = totals.get(d, 0.0) + sum(sku_map_.values())
+        return totals
+
+    ads_cpc_totals = _daily_ads_totals(cpc_by_date)
+    ads_cpo_totals = _daily_ads_totals(cpo_by_date)
+
+    all_dates = set(daily["date"]) | set(ads_cpc_totals.keys()) | set(ads_cpo_totals.keys())
+    daily = daily.set_index("date").reindex(sorted(all_dates)).reset_index()
+    daily["ads_cpc"] = daily["date"].map(ads_cpc_totals).fillna(0.0)
+    daily["ads_cpo"] = daily["date"].map(ads_cpo_totals).fillna(0.0)
+    daily = daily.fillna(0)
+    daily["revenue"] = daily["sale"] + daily["return_sum"]
+    daily["partner_programs"] = daily.get("partner_programs", 0.0)
+    daily["bonus_points"] = daily.get("bonus_points", 0.0)
+    daily["total_income"] = daily["revenue"] + daily["partner_programs"] + daily["bonus_points"]
+    daily["tax"] = TAX * (daily["revenue"] + daily["partner_programs"])
+    daily["acquiring"] = daily["acquiring"].abs()
+    daily["promo"] = daily["promo"].abs()
+    daily["installment"] = daily["installment"].abs()
+    daily["ads_perf"] = daily["ads_cpc"] + daily["ads_cpo"]
+    daily["profit"] = (
+        daily["total_income"]
+        + daily["commission"]
+        + daily["logistics"]
+        - daily["promo"]
+        - daily["installment"]
+        + daily["other_costs"]
+        - daily["cost_total"]
+        - daily["acquiring"]
+        - daily["tax"]
+        - daily["ads_perf"]
+    )
+    daily["margin_pct"] = (daily["profit"] / daily["total_income"].replace(0, float("nan"))) * 100
+    return daily.sort_values("date").reset_index(drop=True)
+
+def build_period_pnl(
+    daily: pd.DataFrame, store_daily: dict, freq: str,
+    perf_replaces_cpc: bool = False, perf_replaces_cpo: bool = False,
+) -> pd.DataFrame:
+    """
+    Сводка P&L по периодам (день/неделя/месяц) для страницы «P&L» (Task #20).
+
+    ВАЖНО (эпистемика — это МОЯ интерпретация макета из скриншота стороннего сервиса,
+    а не официальная методология Ozon): «Операционная прибыль» здесь = доход минус
+    себестоимость, комиссия и расходы внутри МП (логистика/эквайринг/рассрочка/прочее),
+    ДО вычета маркетинга и налога. «Чистая прибыль» = операционная минус маркетинг и
+    налог. ROI считается от себестоимости (Себестоимость), как это принято в юнит-
+    экономике маркетплейсов, но это тоже конвенция, а не единственно верный вариант —
+    некоторые считают ROI от выручки. Если формулы должны быть другими — легко поменять
+    здесь, в одном месте.
+
+    daily         — результат transactions_to_daily_pnl (по дате, уже с ads_cpc/ads_cpo/ads_perf).
+    store_daily   — результат collect_store_costs_daily(raw_ops) (non_item_fee по дате и type_id).
+    freq          — "D" (день), "W" (неделя, с понедельника), "M" (месяц).
+    perf_replaces_cpc/cpo — если Performance API реально заменил type_id 41/54 (см. основной
+                     блок KPI) — тогда эти type_id ИСКЛЮЧАЮТСЯ из «Маркетинг (магазин)», чтобы
+                     не задвоить с daily["ads_perf"] (которая уже считает CPC/CPO по SKU).
+    """
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+
+    daily = daily.copy()
+    daily["date"] = pd.to_datetime(daily["date"])
+
+    # ── Разворачиваем store_daily в DataFrame по дате ────────────────────────
+    excluded_marketing_tids = set()
+    if perf_replaces_cpc:
+        excluded_marketing_tids.add(PERFORMANCE_CPC_STORE_TYPE_ID)
+    if perf_replaces_cpo:
+        excluded_marketing_tids.add(PERFORMANCE_CPO_STORE_TYPE_ID)
+
+    store_rows = []
+    for d, tid_map in (store_daily or {}).items():
+        marketing_store = 0.0
+        other_store = 0.0
+        for tid, amt in tid_map.items():
+            group = STORE_COST_GROUPS.get(tid, "Прочее")
+            if group == "Реклама" and tid in excluded_marketing_tids:
+                continue  # уже учтено в ads_perf (Performance API)
+            if group == "Реклама":
+                marketing_store += amt
+            else:
+                other_store += amt
+        store_rows.append({"date": d, "marketing_store": marketing_store, "other_store": other_store})
+
+    store_df = pd.DataFrame(store_rows, columns=["date", "marketing_store", "other_store"])
+    if not store_df.empty:
+        store_df["date"] = pd.to_datetime(store_df["date"])
+
+    # ── Объединяем: даты либо из daily, либо только из store_daily (напр. подписка
+    # списана в день без продаж) ─────────────────────────────────────────────────
+    all_dates = pd.Index(daily["date"])
+    if not store_df.empty:
+        all_dates = all_dates.union(pd.Index(store_df["date"]))
+    base = pd.DataFrame({"date": sorted(all_dates)})
+
+    merged = base.merge(daily, on="date", how="left").merge(store_df, on="date", how="left")
+    num_cols = [c for c in merged.columns if c != "date"]
+    merged[num_cols] = merged[num_cols].fillna(0.0)
+
+    # ── Метка периода ────────────────────────────────────────────────────────
+    if freq == "D":
+        merged["period_start"] = merged["date"]
+    elif freq == "W":
+        merged["period_start"] = merged["date"] - pd.to_timedelta(merged["date"].dt.weekday, unit="D")
+    elif freq == "M":
+        merged["period_start"] = merged["date"].values.astype("datetime64[M]")
+    else:
+        raise ValueError(f"Неизвестная granularity: {freq}")
+
+    agg_cols = [
+        "qty", "qty_ret", "revenue", "total_income", "commission", "logistics",
+        "acquiring", "promo", "installment", "other_costs", "cost_total",
+        "ads_cpc", "ads_cpo", "ads_perf", "tax", "marketing_store", "other_store",
+    ]
+    agg_cols = [c for c in agg_cols if c in merged.columns]
+    period = merged.groupby("period_start")[agg_cols].sum().reset_index()
+
+    # ── Подписи периодов ─────────────────────────────────────────────────────
+    def _label(ts) -> str:
+        if freq == "D":
+            return ts.strftime("%d.%m.%Y")
+        if freq == "W":
+            end = ts + pd.Timedelta(days=6)
+            return f"{ts.strftime('%d.%m')} – {end.strftime('%d.%m.%Y')}"
+        months_ru = ["январь","февраль","март","апрель","май","июнь","июль",
+                     "август","сентябрь","октябрь","ноябрь","декабрь"]
+        return f"{months_ru[ts.month - 1].capitalize()} {ts.year}"
+
+    period["period_label"] = period["period_start"].apply(_label)
+
+    # ── Продажи ──────────────────────────────────────────────────────────────
+    period["qty_total"] = period["qty"] + period["qty_ret"]
+
+    # ── Комиссия ─────────────────────────────────────────────────────────────
+    period["commission_abs"] = period["commission"].abs()
+    period["commission_pct"] = (period["commission_abs"] / period["revenue"].replace(0, float("nan"))) * 100
+
+    # ── Расходы внутри МП (логистика/эквайринг/рассрочка/прочее по SKU + прочее магазина) ──
+    # non_item_fee (marketing_store/other_store) приходят из Ozon отрицательными (списание),
+    # как и в collect_store_costs() — берём abs(), т.к. все остальные "*_abs" тут уже в
+    # положительных числах-расходах.
+    period["logistics_abs"]   = period["logistics"].abs()
+    period["other_costs_abs"] = period["other_costs"].abs()
+    period["other_store_abs"] = period["other_store"].abs()
+    period["mp_expenses_total"] = (
+        period["logistics_abs"] + period["acquiring"] + period["installment"]
+        + period["other_costs_abs"] + period["other_store_abs"]
+    )
+
+    # ── Маркетинг (по SKU-реклама из item_fees + Performance API CPC/CPO + магазинная реклама,
+    # не заменённая Performance API) ────────────────────────────────────────────
+    period["promo_abs"] = period["promo"].abs()
+    period["marketing_store_abs"] = period["marketing_store"].abs()
+    period["marketing_total"] = period["promo_abs"] + period["ads_perf"] + period["marketing_store_abs"]
+
+    # ── Прибыль ──────────────────────────────────────────────────────────────
+    period["operating_profit"] = (
+        period["total_income"] - period["cost_total"] - period["commission_abs"] - period["mp_expenses_total"]
+    )
+    period["roi_operating_pct"] = (period["operating_profit"] / period["cost_total"].replace(0, float("nan"))) * 100
+    period["net_profit"] = period["operating_profit"] - period["marketing_total"] - period["tax"]
+    period["roi_net_pct"] = (period["net_profit"] / period["cost_total"].replace(0, float("nan"))) * 100
+
+    return period.sort_values("period_start").reset_index(drop=True)
 
 def apply_sku_map(df: pd.DataFrame, sku_map: dict, name_map: dict = None) -> pd.DataFrame:
     """Заменяет числовой SKU на твой артикул (offer_id) и название через справочник."""
@@ -1019,42 +1287,81 @@ def fetch_performance_campaigns(token: str) -> list[dict]:
 
 def fetch_performance_sku_expense(
     token: str, campaign_ids: list[str], date_from: str, date_to: str,
-) -> tuple[dict[str, float], list[str]]:
+) -> tuple[dict[str, float], dict[str, dict[str, float]], list[str], list[dict]]:
     """
     POST /api/client/statistics/products/sku — расход по SKU за период, ТОЛЬКО для
     CPC-кампаний (advObjectType=SKU, "Трафареты"/оплата за клик). Для CPO ("Оплата за
     заказ") этот метод пуст — см. fetch_all_sku_promo_orders_report ниже.
-    По документации метод "не расходует лимиты Performance API". Батчим по 50
-    кампаний на запрос — про максимальный размер campaignIds в одном вызове
-    документация ничего не говорит, батч подстраховывает от больших кабинетов.
-    Возвращает (sku → сумма расхода в рублях, список ID кампаний с ошибкой запроса).
+    По документации метод "не расходует лимиты Performance API".
+
+    Запрос по списку campaignIds — ВСЁ ИЛИ НИЧЕГО: если хотя бы одна кампания в списке
+    вызывает ошибку (например, архивная/некорректная), падает ВЕСЬ запрос, включая
+    статистику по остальным нормальным кампаниям (проверено на реальном кабинете
+    03.08.2026 — 28 кампаний упали одним запросом разом). Поэтому при ошибке батча
+    рекурсивно делим его пополам ("бисекция"), пока не изолируем конкретные проблемные
+    campaignId — так все "здоровые" кампании всё равно отдают расход, а не теряются
+    вместе с одной сломанной. Метод не тратит лимиты Performance API — можно позволить
+    себе лишние запросы на изоляцию без риска упереться в rate limit.
+
+    Ответ содержит поле "date" по каждой строке — используем его, чтобы получить
+    расход И по SKU суммарно за период (totals), И по дням (by_date, для P&L по
+    периодам/истории), без второго запроса.
+
+    Возвращает (sku → сумма расхода за весь период, {дата: {sku: расход}},
+    список ID кампаний с ошибкой, список примеров реальных ошибок API — макс. 5 шт).
     """
     totals: dict[str, float] = {}
+    by_date: dict[str, dict[str, float]] = {}
     failed: list[str] = []
+    error_samples: list[dict] = []
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    BATCH = 50
-    for i in range(0, len(campaign_ids), BATCH):
-        batch = campaign_ids[i:i + BATCH]
+
+    def _query(ids: list[str]):
+        """Один HTTP-запрос. Возвращает (ok, status, текст_ошибки)."""
         try:
             resp = requests.post(
                 f"{PERFORMANCE_API_URL}/api/client/statistics/products/sku",
-                json={"campaignIds": batch, "dateFrom": date_from, "dateTo": date_to},
+                json={"campaignIds": ids, "dateFrom": date_from, "dateTo": date_to},
                 headers=headers, timeout=60,
             )
-        except Exception:
-            failed.extend(batch)
-            continue
+        except Exception as e:
+            return False, None, str(e)
         if resp.status_code != 200:
-            failed.extend(batch)
-            continue
+            return False, resp.status_code, resp.text[:300]
         for row in (resp.json() or {}).get("rows", []):
             sku = str(row.get("sku") or "")
             if not sku:
                 continue
-            totals[sku] = totals.get(sku, 0.0) + float(row.get("expense") or 0)
-    return totals, failed
+            expense = float(row.get("expense") or 0)
+            totals[sku] = totals.get(sku, 0.0) + expense
+            d = str(row.get("date") or "")[:10]
+            if d:
+                by_date.setdefault(d, {})
+                by_date[d][sku] = by_date[d].get(sku, 0.0) + expense
+        return True, 200, None
 
-def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], str]:
+    def _process(ids: list[str]):
+        if not ids:
+            return
+        ok, status, text = _query(ids)
+        if ok:
+            return
+        if len(ids) == 1:
+            failed.extend(ids)
+            if len(error_samples) < 5:
+                error_samples.append({"campaignId": ids[0], "status": status, "error": text})
+            return
+        mid = len(ids) // 2
+        _process(ids[:mid])
+        _process(ids[mid:])
+
+    BATCH = 50
+    for i in range(0, len(campaign_ids), BATCH):
+        _process(campaign_ids[i:i + BATCH])
+
+    return totals, by_date, failed, error_samples
+
+def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], dict[str, dict[str, float]], str]:
     """
     Парсит файл 'Оплата за заказ (все товары). Отчёт по заказам', выгружаемый вручную
     из личного кабинета Ozon (xlsx/csv). Формат подтверждён на реальном файле
@@ -1065,9 +1372,11 @@ def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], st
 
     Берём колонку "SKU" (что реально продано), а НЕ "SKU продвигаемого товара"
     (может отличаться при кросс-показах) — расход ложится на тот же артикул,
-    по которому в таблице уже считается выручка.
+    по которому в таблице уже считается выручка. Колонка "Дата" (формат ДД.ММ.ГГГГ
+    в файле) используется для дневной разбивки — для P&L по периодам/истории.
 
-    Возвращает (sku → сумма расхода, текст ошибки или "" если всё ок).
+    Возвращает (sku → сумма расхода за весь файл, {дата ГГГГ-ММ-ДД: {sku: расход}},
+    текст ошибки или "" если всё ок).
     """
     try:
         name = (getattr(uploaded_file, "name", "") or "").lower()
@@ -1076,7 +1385,7 @@ def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], st
         else:
             raw = pd.read_excel(uploaded_file, header=None)
     except Exception as e:
-        return {}, f"Не удалось прочитать файл: {e}"
+        return {}, {}, f"Не удалось прочитать файл: {e}"
 
     header_row_idx = None
     for i in range(min(10, len(raw))):
@@ -1085,7 +1394,7 @@ def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], st
             header_row_idx = i
             break
     if header_row_idx is None:
-        return {}, "Не нашла строку с заголовками колонок (ищу ячейку 'SKU') — формат файла отличается от ожидаемого"
+        return {}, {}, "Не нашла строку с заголовками колонок (ищу ячейку 'SKU') — формат файла отличается от ожидаемого"
 
     headers = [str(v).strip() for v in raw.iloc[header_row_idx].tolist()]
     data = raw.iloc[header_row_idx + 1:].copy()
@@ -1093,10 +1402,12 @@ def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], st
 
     sku_col = next((c for c in headers if c == "SKU"), None)
     expense_col = next((c for c in headers if str(c).strip().lower().startswith("расход")), None)
+    date_col = next((c for c in headers if str(c).strip().lower() == "дата"), None)
     if not sku_col or not expense_col:
-        return {}, f"Не нашла колонки 'SKU' / 'Расход, ₽'. Колонки в файле: {headers}"
+        return {}, {}, f"Не нашла колонки 'SKU' / 'Расход, ₽'. Колонки в файле: {headers}"
 
-    data = data[[sku_col, expense_col]].dropna(subset=[sku_col])
+    keep_cols = [sku_col, expense_col] + ([date_col] if date_col else [])
+    data = data[keep_cols].dropna(subset=[sku_col])
     data[sku_col] = data[sku_col].astype(str).str.strip()
     data = data[data[sku_col].str.len() > 0]
     data[expense_col] = (
@@ -1107,8 +1418,17 @@ def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], st
         .pipe(pd.to_numeric, errors="coerce")
         .fillna(0.0)
     )
+
     grouped = data.groupby(sku_col)[expense_col].sum()
-    return {str(k): float(v) for k, v in grouped.items()}, ""
+    totals = {str(k): float(v) for k, v in grouped.items()}
+
+    by_date: dict[str, dict[str, float]] = {}
+    if date_col:
+        data["_iso_date"] = pd.to_datetime(data[date_col], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
+        for d, sub in data.dropna(subset=["_iso_date"]).groupby("_iso_date"):
+            by_date[d] = sub.groupby(sku_col)[expense_col].sum().to_dict()
+
+    return totals, by_date, ""
 
 def fetch_all_sku_promo_orders_report(token: str, date_from: str, date_to: str, timeout_s: int = 90) -> dict:
     """
@@ -1124,7 +1444,7 @@ def fetch_all_sku_promo_orders_report(token: str, date_from: str, date_to: str, 
     другим — вернёт понятную ошибку с примером сырых данных, а не тихий ноль.
     Надёжный запасной вариант — загрузка того же отчёта файлом (см. sidebar).
     """
-    out = {"by_sku": {}, "total": 0.0, "error": "", "raw_sample": None}
+    out = {"by_sku": {}, "by_date": {}, "total": 0.0, "error": "", "raw_sample": None}
     headers = {"Authorization": f"Bearer {token}"}
     tb_from, tb_to = f"{date_from}T00:00:00Z", f"{date_to}T23:59:59Z"
     try:
@@ -1208,11 +1528,13 @@ def fetch_all_sku_promo_orders_report(token: str, date_from: str, date_to: str, 
                 (k for k in sample_keys if any(t in str(k).lower() for t in ("expense", "расход", "spend", "spent"))),
                 None,
             )
+        date_key = next((k for k in sample_keys if str(k).strip().lower() == "date"), None)
         if sku_key is None or expense_key is None:
             out["error"] = f"Не распознала колонки SKU/расход в ответе API. Ключи в строке: {sample_keys}"
             return out
 
         totals: dict[str, float] = {}
+        by_date: dict[str, dict[str, float]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -1224,7 +1546,21 @@ def fetch_all_sku_promo_orders_report(token: str, date_from: str, date_to: str, 
             except Exception:
                 val = 0.0
             totals[sku] = totals.get(sku, 0.0) + val
+            if date_key:
+                raw_d = str(row.get(date_key) or "").strip()
+                iso_d = None
+                # Подтверждённый формат из реального ответа — ДД.ММ.ГГГГ (как в файле).
+                if raw_d and "." in raw_d:
+                    parts = raw_d.split(".")
+                    if len(parts) == 3 and len(parts[2]) == 4:
+                        iso_d = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                elif len(raw_d) == 10 and raw_d[4] == "-":
+                    iso_d = raw_d   # уже ISO (YYYY-MM-DD) — на случай другого формата в будущем
+                if iso_d:
+                    by_date.setdefault(iso_d, {})
+                    by_date[iso_d][sku] = by_date[iso_d].get(sku, 0.0) + val
         out["by_sku"] = totals
+        out["by_date"] = by_date
         out["total"] = sum(totals.values())
     except Exception as e:
         out["error"] = f"{e}"
@@ -1244,8 +1580,8 @@ def fetch_performance_ad_spend(
     out = {
         "by_sku": {}, "total": 0.0, "fetched": True, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {},
-        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {},
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {}, "cpc_by_date": {}, "cpc_error_samples": [],
+        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {}, "cpo_by_date": {},
     }
     try:
         token = get_performance_token(perf_client_id, perf_client_secret)
@@ -1271,9 +1607,11 @@ def fetch_performance_ad_spend(
             if isinstance(c, dict) and str(c.get("advObjectType") or "").upper() == "SKU"
         ]
         if cpc_ids:
-            cpc_by_sku, failed = fetch_performance_sku_expense(token, cpc_ids, date_from, date_to)
+            cpc_by_sku, cpc_by_date, failed, error_samples = fetch_performance_sku_expense(token, cpc_ids, date_from, date_to)
+            out["cpc_by_date"] = cpc_by_date
             out["cpc_campaigns_used"] = len(cpc_ids) - len(failed)
             out["cpc_campaigns_failed"] = failed
+            out["cpc_error_samples"] = error_samples
             out["cpc_ok"] = len(failed) < len(cpc_ids)   # хоть одна кампания отдала данные
         else:
             out["cpc_ok"] = True   # CPC-кампаний в кабинете просто нет — это не ошибка
@@ -1284,13 +1622,15 @@ def fetch_performance_ad_spend(
     # ── CPO: "Оплата за заказ — все товары" ───────────────────────────────────
     cpo_by_sku: dict[str, float] = {}
     if cpo_orders_file is not None:
-        cpo_by_sku, cpo_err = parse_all_sku_promo_orders_file(cpo_orders_file)
+        cpo_by_sku, cpo_by_date, cpo_err = parse_all_sku_promo_orders_file(cpo_orders_file)
+        out["cpo_by_date"] = cpo_by_date
         out["cpo_source"] = "file"
         out["cpo_error"] = cpo_err
         out["cpo_ok"] = not cpo_err
     else:
         cpo_result = fetch_all_sku_promo_orders_report(token, date_from, date_to)
         cpo_by_sku = cpo_result.get("by_sku", {})
+        out["cpo_by_date"] = cpo_result.get("by_date", {})
         out["cpo_source"] = "api"
         out["cpo_error"] = cpo_result.get("error") or ""
         out["cpo_raw_sample"] = cpo_result.get("raw_sample")
@@ -1512,8 +1852,8 @@ if "perf_ad_meta" not in st.session_state:
     st.session_state.perf_ad_meta = {
         "total": 0.0, "fetched": False, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {},
-        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {},
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {}, "cpc_by_date": {}, "cpc_error_samples": [],
+        "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {}, "cpo_by_date": {},
     }
 
 if demo_btn:
@@ -1574,8 +1914,8 @@ if load_btn:
         st.session_state.perf_ad_meta = {
             "total": 0.0, "fetched": False, "error": None,
             "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-            "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {},
-            "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {},
+            "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {}, "cpc_by_date": {}, "cpc_error_samples": [],
+            "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {}, "cpo_by_date": {},
         }
         with st.spinner("Загружаем данные из Ozon API..."):
             try:
@@ -1687,12 +2027,25 @@ if load_btn:
                                 f"({len(perf_result['cpc_campaigns_failed'])} кампаний с ошибкой) — "
                                 f"эта часть расхода останется в «Расходах магазина» одной суммой."
                             )
+                            if perf_result.get("cpc_error_samples"):
+                                with st.expander("🔍 Реальный текст ошибки от Performance API", expanded=True):
+                                    st.dataframe(
+                                        pd.DataFrame(perf_result["cpc_error_samples"]),
+                                        use_container_width=True, hide_index=True,
+                                    )
                         elif perf_result["cpc_campaigns_failed"]:
                             st.warning(
-                                f"⚠️ CPC: не ответили {len(perf_result['cpc_campaigns_failed'])} из "
+                                f"⚠️ CPC: {len(perf_result['cpc_campaigns_failed'])} из "
                                 f"{perf_result['cpc_campaigns_used'] + len(perf_result['cpc_campaigns_failed'])} "
-                                f"кампаний — расход может быть немного занижен."
+                                f"кампаний реально проблемные (изолированы, остальные подтянулись нормально) — "
+                                f"расход по ним не учтён."
                             )
+                            if perf_result.get("cpc_error_samples"):
+                                with st.expander("🔍 Какие кампании и почему не подтянулись"):
+                                    st.dataframe(
+                                        pd.DataFrame(perf_result["cpc_error_samples"]),
+                                        use_container_width=True, hide_index=True,
+                                    )
                         if perf_result["cpo_error"]:
                             st.warning(f"⚠️ CPO (оплата за заказ): {perf_result['cpo_error']}")
 
@@ -2449,6 +2802,15 @@ def page_details():
             if _perf_meta_diag.get("cpo_raw_sample"):
                 st.caption("Сырой пример строк CPO-отчёта (для диагностики схемы ответа API):")
                 st.json(_perf_meta_diag["cpo_raw_sample"])
+            if _perf_meta_diag.get("cpc_error_samples"):
+                st.caption(
+                    "Реальные ошибки API по проблемным CPC-кампаниям (до 5 примеров) — "
+                    "статус и текст ответа Ozon, а не догадки:"
+                )
+                st.dataframe(
+                    pd.DataFrame(_perf_meta_diag["cpc_error_samples"]),
+                    use_container_width=True, hide_index=True,
+                )
         else:
             st.warning("df ещё не загружен — сначала нажмите «Загрузить данные»")
 
@@ -2759,11 +3121,200 @@ def page_details():
                 height=400,
             )
 
+def page_pnl():
+    """
+    Страница «P&L» (Task #20) — сводка по периодам (день/неделя/месяц) с
+    раскрывающимися группами столбцов (streamlit-aggrid), по образцу скриншотов
+    стороннего сервиса аналитики, которые прислал пользователь 03.08.2026.
+
+    Отдельная страница, НЕ замена «По артикулам» — по явному решению пользователя
+    (there were 3 варианта, выбран «Отдельная страница»). Формулы Операционной/
+    Чистой прибыли — интерпретация макета, см. docstring build_period_pnl().
+
+    История периодов пока НЕ сохраняется между загрузками (Task #17/#19, Google
+    Sheets — заблокировано, ждём service account JSON от пользователя). Каждая
+    загрузка показывает P&L только за выбранный в сайдбаре период.
+    """
+    st.subheader("📈 P&L по периодам")
+
+    raw_ops_pnl = st.session_state.get("raw_ops", [])
+    if not raw_ops_pnl:
+        st.info("👈 Сначала загрузи данные в боковом меню («Загрузить данные»).")
+        return
+
+    cost_map_pnl = st.session_state.get("_cost_map_debug", {})
+    perf_meta_pnl = st.session_state.get("perf_ad_meta", {}) or {}
+    _use_perf_pnl = bool(use_perf_ads)
+    cpc_by_date_pnl = perf_meta_pnl.get("cpc_by_date", {}) if _use_perf_pnl else {}
+    cpo_by_date_pnl = perf_meta_pnl.get("cpo_by_date", {}) if _use_perf_pnl else {}
+
+    daily_pnl = transactions_to_daily_pnl(raw_ops_pnl, cost_map_pnl, cpc_by_date_pnl, cpo_by_date_pnl)
+    if daily_pnl.empty:
+        st.info("Нет данных о начислениях за выбранный период.")
+        return
+    store_daily_pnl = collect_store_costs_daily(raw_ops_pnl)
+
+    gran_map = {"По дням": "D", "По неделям": "W", "По месяцам": "M"}
+    gran_label = st.radio("Группировка периода", list(gran_map.keys()), index=1, horizontal=True)
+    freq = gran_map[gran_label]
+
+    period_df = build_period_pnl(
+        daily_pnl, store_daily_pnl, freq,
+        perf_replaces_cpc=_perf_replaces_cpc, perf_replaces_cpo=_perf_replaces_cpo,
+    )
+    if period_df.empty:
+        st.info("Нет данных за выбранный период.")
+        return
+
+    display = pd.DataFrame({
+        "period":             period_df["period_label"],
+        "qty_total":          period_df["qty_total"],
+        "qty":                period_df["qty"],
+        "qty_ret":            period_df["qty_ret"],
+        "revenue":            period_df["revenue"],
+        "total_income":       period_df["total_income"],
+        "commission_abs":     period_df["commission_abs"],
+        "commission_pct":     period_df["commission_pct"],
+        "cost_total":         period_df["cost_total"],
+        "logistics_abs":      period_df["logistics_abs"],
+        "acquiring":          period_df["acquiring"],
+        "installment":        period_df["installment"],
+        "other_costs_abs":    period_df["other_costs_abs"],
+        "other_store_abs":    period_df["other_store_abs"],
+        "mp_expenses_total":  period_df["mp_expenses_total"],
+        "marketing_total":    period_df["marketing_total"],
+        "tax":                period_df["tax"],
+        "operating_profit":   period_df["operating_profit"],
+        "roi_operating_pct":  period_df["roi_operating_pct"],
+        "net_profit":         period_df["net_profit"],
+        "roi_net_pct":        period_df["roi_net_pct"],
+    })
+
+    if _AGGRID_AVAILABLE:
+        _rub_fmt = JsCode("""
+            function(params) {
+                if (params.value === null || params.value === undefined || isNaN(params.value)) return '—';
+                var v = Math.round(params.value);
+                var s = Math.abs(v).toLocaleString('ru-RU').replace(/,/g, ' ');
+                return (v < 0 ? '-' : '') + s + ' ₽';
+            }
+        """)
+        _pct_fmt = JsCode("""
+            function(params) {
+                if (params.value === null || params.value === undefined || isNaN(params.value)) return '—';
+                return params.value.toFixed(1).replace('.', ',') + ' %';
+            }
+        """)
+        _int_fmt = JsCode("""
+            function(params) {
+                if (params.value === null || params.value === undefined || isNaN(params.value)) return '—';
+                return Math.round(params.value).toLocaleString('ru-RU').replace(/,/g, ' ');
+            }
+        """)
+        _profit_style = JsCode("""
+            function(params) {
+                if (params.value === null || params.value === undefined) return {};
+                return { color: params.value >= 0 ? '#3DD68C' : '#F05B5B', fontWeight: 'bold' };
+            }
+        """)
+
+        def _leaf(field, header, fmt=_rub_fmt, width=110, style=None):
+            d = {"field": field, "headerName": header, "width": width, "valueFormatter": fmt}
+            if style:
+                d["cellStyle"] = style
+            return d
+
+        column_defs = [
+            {"field": "period", "headerName": "Период", "pinned": "left", "width": 150},
+            {"headerName": "Продажи", "children": [
+                _leaf("qty_total", "Всего", _int_fmt, 90),
+                _leaf("qty", "Продажи", _int_fmt, 90),
+                _leaf("qty_ret", "Возвраты", _int_fmt, 90),
+            ]},
+            _leaf("revenue", "Выручка", width=120),
+            _leaf("total_income", "Доход с продаж покупателям", width=160),
+            {"headerName": "Комиссия", "children": [
+                _leaf("commission_abs", "Сумма", width=110),
+                _leaf("commission_pct", "Процент", _pct_fmt, 90),
+            ]},
+            _leaf("cost_total", "Себестоимость", width=130),
+            {"headerName": "Расходы внутри МП", "children": [
+                _leaf("logistics_abs", "Логистика", width=110),
+                _leaf("acquiring", "Эквайринг", width=110),
+                _leaf("installment", "Рассрочка", width=110),
+                _leaf("other_costs_abs", "Прочее (по SKU)", width=130),
+                _leaf("other_store_abs", "Прочее (магазин)", width=140),
+                _leaf("mp_expenses_total", "Итого", width=120),
+            ]},
+            _leaf("marketing_total", "Маркетинг", width=120),
+            _leaf("tax", "Налог", width=100),
+            {"headerName": "Операционная прибыль", "children": [
+                _leaf("operating_profit", "Сумма", width=130, style=_profit_style),
+                _leaf("roi_operating_pct", "ROI", _pct_fmt, 90),
+            ]},
+            {"headerName": "Чистая прибыль", "children": [
+                _leaf("net_profit", "Сумма", width=130, style=_profit_style),
+                _leaf("roi_net_pct", "ROI", _pct_fmt, 90),
+            ]},
+        ]
+
+        grid_options = {
+            "columnDefs": column_defs,
+            "defaultColDef": {"resizable": True, "sortable": False, "suppressMovable": True},
+            "suppressColumnVirtualisation": True,
+        }
+
+        AgGrid(
+            display,
+            gridOptions=grid_options,
+            allow_unsafe_jscode=True,
+            theme="streamlit",
+            height=min(80 + 42 * len(display), 600),
+            show_toolbar=False,
+            show_search=False,
+            show_download_button=False,
+        )
+    else:
+        st.warning(
+            "⚠️ Пакет streamlit-aggrid ещё не подхватился на сервере — показываю обычную таблицу "
+            "без раскрывающихся групп столбцов. Обычно помогает «Reboot app» в Streamlit Cloud "
+            "после первого деплоя с обновлённым requirements.txt."
+        )
+        rename = {
+            "period": "Период", "qty_total": "Всего шт", "qty": "Продано шт", "qty_ret": "Возвращено шт",
+            "revenue": "Выручка", "total_income": "Доход с продаж покупателям",
+            "commission_abs": "Комиссия, ₽", "commission_pct": "Комиссия, %",
+            "cost_total": "Себестоимость",
+            "logistics_abs": "Логистика", "acquiring": "Эквайринг", "installment": "Рассрочка",
+            "other_costs_abs": "Прочее (SKU)", "other_store_abs": "Прочее (магазин)",
+            "mp_expenses_total": "Расходы внутри МП, итого",
+            "marketing_total": "Маркетинг", "tax": "Налог",
+            "operating_profit": "Операционная прибыль", "roi_operating_pct": "ROI операц., %",
+            "net_profit": "Чистая прибыль", "roi_net_pct": "ROI чистая, %",
+        }
+        fallback = display.rename(columns=rename)
+        skip_rub = {"Период", "Всего шт", "Продано шт", "Возвращено шт", "Комиссия, %", "ROI операц., %", "ROI чистая, %"}
+        fmt_dict = {c: (lambda v: ru_rub(v, 0)) for c in fallback.columns if c not in skip_rub}
+        fmt_dict["Комиссия, %"] = ru_pct
+        fmt_dict["ROI операц., %"] = ru_pct
+        fmt_dict["ROI чистая, %"] = ru_pct
+        st.dataframe(fallback.style.format(fmt_dict, na_rep="—"), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.caption(
+        "**Себестоимость** — нетто по возвратам. **Маркетинг** = реклама по SKU (Seller API) + "
+        "Performance API CPC/CPO (если подключён и включён) + магазинная реклама, не заменённая "
+        "Performance API — без задвоения. **ROI** считается от себестоимости (юнит-экономика), "
+        "а не от выручки — если нужна другая формула, легко поменять. История периодов пока не "
+        "сохраняется между загрузками — это отдельная задача (Google Sheets)."
+    )
+
 # ── Навигация (левое меню, как в стороннем сервисе) ──────────────────────────
 # Диаграммы и Калькулятор убраны по просьбе пользователя (02.08.2026) — раньше были
 # отдельными вкладками st.tabs(), больше нигде не используются.
 pg = st.navigation([
     st.Page(page_articles, title="По артикулам", icon="📋", default=True),
+    st.Page(page_pnl,      title="P&L",          icon="📈"),
     st.Page(page_stocks,   title="Остатки",      icon="📦"),
     st.Page(page_details,  title="Детализация",  icon="🔍"),
 ])
