@@ -23,7 +23,7 @@ except Exception:
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "03.08.2026 23:15"
+APP_BUILD_VERSION = "03.08.2026 23:22"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -870,7 +870,7 @@ def transactions_to_df(ops: list[dict]) -> pd.DataFrame:
 
 def transactions_to_daily_pnl(
     ops: list[dict], cost_map: dict,
-    cpc_by_date: dict = None, cpo_by_date: dict = None,
+    cpc_by_date: dict = None, cpo_by_date: dict = None, sku_map: dict = None,
 ) -> pd.DataFrame:
     """
     P&L по ДНЯМ (а не по артикулам) — для страницы «P&L» и для сохранения истории.
@@ -879,15 +879,22 @@ def transactions_to_daily_pnl(
     в каждой строке — см. fetch_performance_sku_expense/fetch_all_sku_promo_orders_report),
     затем сворачивает до одной строки на календарный день.
 
-    Считается ПОСЛЕ применения sku_map (article уже должен быть настоящим офер_id,
-    не сырым числовым SKU) — передавай ops туда же, откуда взят df для transactions_to_df,
-    но article в _build_transaction_rows берётся из самого accrual (offer_id), а не из
-    sku_map, так что для товаров без offer_id в API артикул останется числовым SKU —
-    это ожидаемо и не мешает суммам, только отображению в будущей детализации по товару.
+    ИСПРАВЛЕНО 03.08.2026 (нашёл пользователь — себестоимость на странице «P&L» была
+    везде 0 ₽): _build_transaction_rows берёт article из offer_id САМОГО accrual, а он
+    у Ozon на практике почти всегда пустой — раньше это ошибочно считалось редким
+    краевым случаем. В реальности почти ВСЕ строки оставались с article = сырой
+    числовой SKU, который не совпадает с ключами cost_map (там артикулы из
+    загруженного пользователем файла себестоимости) — себестоимость нигде не
+    находилась. На странице «По артикулам» этой проблемы нет, т.к. там article
+    поверх подменяется через sku_map/_offer_id_map ДО enrich_with_cost — здесь нужно
+    делать то же самое явно, передавая sku_map (см. st.session_state.sku_map_cache).
     """
     fine = _build_transaction_rows(ops)
     if fine.empty:
         return fine
+
+    if sku_map:
+        fine["article"] = fine["sku"].map(sku_map).fillna(fine["article"])
 
     fine["cost_price"] = fine["article"].map(cost_map).fillna(0)
     fine["qty_net"] = fine["qty"] - fine["qty_ret"]
@@ -3317,12 +3324,15 @@ def page_pnl():
         return
 
     cost_map_pnl = st.session_state.get("_cost_map_debug", {})
+    sku_map_pnl = st.session_state.get("sku_map_cache", {})
     perf_meta_pnl = st.session_state.get("perf_ad_meta", {}) or {}
     _use_perf_pnl = bool(use_perf_ads)
     cpc_by_date_pnl = perf_meta_pnl.get("cpc_by_date", {}) if _use_perf_pnl else {}
     cpo_by_date_pnl = perf_meta_pnl.get("cpo_by_date", {}) if _use_perf_pnl else {}
 
-    daily_pnl = transactions_to_daily_pnl(raw_ops_pnl, cost_map_pnl, cpc_by_date_pnl, cpo_by_date_pnl)
+    daily_pnl = transactions_to_daily_pnl(
+        raw_ops_pnl, cost_map_pnl, cpc_by_date_pnl, cpo_by_date_pnl, sku_map=sku_map_pnl,
+    )
     if daily_pnl.empty:
         st.info("Нет данных о начислениях за выбранный период.")
         return
