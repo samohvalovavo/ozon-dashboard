@@ -23,7 +23,7 @@ except Exception:
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "03.08.2026 23:22"
+APP_BUILD_VERSION = "03.08.2026 23:25"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -2078,6 +2078,19 @@ if load_btn:
         }
         with st.spinner("Загружаем данные из Ozon API..."):
             try:
+                # Справочник типов начислений (type_id → название) — ОДИН дешёвый запрос,
+                # кэшируется на сутки. Специально идёт ПЕРВЫМ, до тяжёлого цикла
+                # fetch_transactions (который на широком периоде — по запросу на день,
+                # десятки запросов подряд) — иначе этот запрос конкурирует за rate limit
+                # сразу после серии других вызовов и стабильно ловит 429, даже с retry
+                # (найдено пользователем 03.08.2026 — часть type_id падала в "type_N"
+                # вместо названия именно из-за этого; порядок вызовов — часть фикса,
+                # retry сам по себе это не решал).
+                with st.spinner("Загружаем справочник типов начислений..."):
+                    api_type_names = fetch_accrual_types(client_id, api_key)
+                    if api_type_names:
+                        TYPE_NAMES.update(api_type_names)
+
                 if use_transactions:
                     ops = fetch_transactions(client_id, api_key,
                                              d_from.strftime("%Y-%m-%d"),
@@ -2090,12 +2103,6 @@ if load_btn:
                 if raw_df.empty:
                     st.warning("Нет данных за выбранный период. Отчёт реализации формируется Ozon в начале следующего месяца.")
                 else:
-                    # Загружаем справочник типов начислений (type_id → название)
-                    with st.spinner("Загружаем справочник типов начислений..."):
-                        api_type_names = fetch_accrual_types(client_id, api_key)
-                        if api_type_names:
-                            TYPE_NAMES.update(api_type_names)
-
                     # Загружаем справочник sku → offer_id
                     # Сначала быстрый путь: turnover/stocks (Product read-only)
                     with st.spinner("Загружаем справочник артикулов..."):
@@ -2389,7 +2396,7 @@ if store_costs or total_tax or _perf_unmatched:
             if amt == 0:
                 continue
             sc_rows.append({
-                "Статья": TYPE_NAMES.get(tid, f"type_{tid}"),
+                "Статья": TYPE_NAMES.get(tid, f"Начисление №{tid} (не удалось получить название из API)"),
                 "Группа": STORE_COST_GROUPS.get(tid, "Прочее"),
                 "Сумма": amt,
             })
