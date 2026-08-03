@@ -23,7 +23,7 @@ except Exception:
 # Версия сборки — время последнего деплоя (проставляется вручную перед каждым git push,
 # см. блок деплоя в OZON_DASHBOARD_CONTEXT.md). Показывается в сайдбаре, чтобы можно было
 # на глаз проверить, подхватился ли последний пуш, не заходя на GitHub.
-APP_BUILD_VERSION = "03.08.2026 22:47"
+APP_BUILD_VERSION = "03.08.2026 23:15"
 
 # ── Настройки страницы ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -247,7 +247,7 @@ def _secret(key: str, default: str = "") -> str:
     except Exception:
         return default
 
-def api_post(endpoint: str, body: dict, client_id: str, api_key: str, _retries: int = 4) -> dict:
+def api_post(endpoint: str, body: dict, client_id: str, api_key: str, _retries: int = 6) -> dict:
     """
     Запрос к Ozon Seller API.
     При 429 (rate limit) — тихо ждём и повторяем (до _retries раз, с нарастающей паузой),
@@ -1361,6 +1361,138 @@ def fetch_performance_sku_expense(
 
     return totals, by_date, failed, error_samples
 
+def fetch_cpc_report_async(
+    token: str, campaign_ids: list[str], date_from: str, date_to: str, timeout_s: int = 90,
+) -> dict:
+    """
+    Асинхронный отчёт по CPC-кампаниям ("Трафареты"/оплата за клик) за ЛЮБОЙ период —
+    в отличие от fetch_performance_sku_expense (POST /api/client/statistics/products/sku),
+    который, как выяснилось на реальном кабинете 03.08.2026, принимает только "today
+    или yesterday" (в документации: dateFrom "не раньше предыдущего дня") — при попытке
+    запросить более раннюю дату Ozon отвечает 400
+    {"error":"date range must contain only today or yesterday"}. Это НЕ баг бисекции —
+    это жёсткое ограничение самого метода, обойти батчами/повторами нельзя.
+
+    Используем общий асинхронный эндпоинт POST /api/client/statistics/json (кампании
+    любого типа, включая "Оплата за клик" — см. документацию, раздел "Архивы с
+    примерами отчётов... Оплата за клик"), тот же поток generate → poll UUID → report,
+    что уже работает для CPO (fetch_all_sku_promo_orders_report). Максимальный период
+    одного запроса — 62 дня (задокументировано) → бьём диапазон на куски.
+
+    ВАЖНО (честно про неопределённость — это НЕ проверено на реальных данных, в
+    отличие от CPO-отчёта, который сверяли построчно с выгруженным файлом): точные
+    ключи JSON-строк этого отчёта для CPC Ozon явно не документирует — только
+    человекочитаемые названия колонок. Предполагаем ту же схему полей, что и у
+    синхронного /statistics/products/sku (campaignId, sku, date, expense...), т.к.
+    Ozon обычно переиспользует формат строк между sync/async версией одного отчёта —
+    но это ПРЕДПОЛОЖЕНИЕ. Если формат другой — вернёт raw_sample с примером сырых
+    строк вместо тихого нуля, чтобы можно было поправить парсинг за один проход.
+    """
+    out = {"by_sku": {}, "by_date": {}, "total": 0.0, "error": "", "raw_sample": None, "chunks_failed": []}
+    if not campaign_ids:
+        return out
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    from_dt = date.fromisoformat(date_from)
+    to_dt = date.fromisoformat(date_to)
+    chunks = []
+    cur = from_dt
+    while cur <= to_dt:
+        chunk_end = min(cur + timedelta(days=61), to_dt)   # 62 дня включительно (задокументированный максимум)
+        chunks.append((cur.isoformat(), chunk_end.isoformat()))
+        cur = chunk_end + timedelta(days=1)
+
+    import time as _time
+    totals: dict[str, float] = {}
+    by_date: dict[str, dict[str, float]] = {}
+    raw_sample = None
+    CAMPAIGN_BATCH = 100   # на случай недокументированного лимита на размер campaigns[]
+
+    for chunk_from, chunk_to in chunks:
+        for i in range(0, len(campaign_ids), CAMPAIGN_BATCH):
+            batch_ids = campaign_ids[i:i + CAMPAIGN_BATCH]
+            period_label = f"{chunk_from}..{chunk_to}"
+            try:
+                gen = requests.post(
+                    f"{PERFORMANCE_API_URL}/api/client/statistics/json",
+                    json={"campaigns": batch_ids, "dateFrom": chunk_from, "dateTo": chunk_to},
+                    headers=headers, timeout=30,
+                )
+            except Exception as e:
+                out["chunks_failed"].append({"period": period_label, "error": str(e)})
+                continue
+            if gen.status_code != 200:
+                out["chunks_failed"].append({"period": period_label, "status": gen.status_code, "error": gen.text[:300]})
+                continue
+            uuid = (gen.json() or {}).get("UUID")
+            if not uuid:
+                out["chunks_failed"].append({"period": period_label, "error": f"нет UUID в ответе: {gen.text[:200]}"})
+                continue
+
+            state = None
+            deadline = _time.time() + timeout_s
+            while _time.time() < deadline:
+                st_resp = requests.get(f"{PERFORMANCE_API_URL}/api/client/statistics/{uuid}", headers=headers, timeout=30)
+                if st_resp.status_code != 200:
+                    _time.sleep(3)
+                    continue
+                st_data = st_resp.json() or {}
+                state = st_data.get("state")
+                if state in ("OK", "ERROR"):
+                    break
+                _time.sleep(3)
+            if state != "OK":
+                out["chunks_failed"].append({"period": period_label, "error": f"отчёт не готов (статус: {state})"})
+                continue
+
+            rep = requests.get(
+                f"{PERFORMANCE_API_URL}/api/client/statistics/report",
+                params={"UUID": uuid}, headers=headers, timeout=60,
+            )
+            if rep.status_code != 200:
+                out["chunks_failed"].append({"period": period_label, "error": f"report {rep.status_code}: {rep.text[:200]}"})
+                continue
+
+            rows = None
+            try:
+                parsed = rep.json()
+                rows = parsed if isinstance(parsed, list) else (parsed.get("rows") or parsed.get("items"))
+            except Exception:
+                rows = None
+            if rows is None:
+                import csv, io
+                text = rep.text
+                delimiter = ";" if text.count(";") > text.count(",") else ","
+                all_rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+                rows = [dict(zip([h.strip() for h in all_rows[0]], r)) for r in all_rows[1:]] if len(all_rows) >= 2 else []
+
+            if rows and raw_sample is None:
+                raw_sample = rows[:3]
+
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                sku = str(row.get("sku") or row.get("SKU") or "").strip()
+                if not sku:
+                    continue
+                try:
+                    expense = float(str(row.get("expense") or row.get("расход") or "0").replace(",", "."))
+                except Exception:
+                    expense = 0.0
+                totals[sku] = totals.get(sku, 0.0) + expense
+                d = str(row.get("date") or "").strip()[:10]
+                if d:
+                    by_date.setdefault(d, {})
+                    by_date[d][sku] = by_date[d].get(sku, 0.0) + expense
+
+    out["by_sku"] = totals
+    out["by_date"] = by_date
+    out["total"] = sum(totals.values())
+    out["raw_sample"] = raw_sample
+    if not totals and out["chunks_failed"]:
+        out["error"] = f"Не удалось получить ни одного куска отчёта ({len(out['chunks_failed'])} ошибок за периоды) — см. диагностику."
+    return out
+
 def parse_all_sku_promo_orders_file(uploaded_file) -> tuple[dict[str, float], dict[str, dict[str, float]], str]:
     """
     Парсит файл 'Оплата за заказ (все товары). Отчёт по заказам', выгружаемый вручную
@@ -1580,7 +1712,7 @@ def fetch_performance_ad_spend(
     out = {
         "by_sku": {}, "total": 0.0, "fetched": True, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {}, "cpc_by_date": {}, "cpc_error_samples": [],
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_source": None, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {}, "cpc_by_date": {}, "cpc_error_samples": [], "cpc_raw_sample": None,
         "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {}, "cpo_by_date": {},
     }
     try:
@@ -1590,7 +1722,15 @@ def fetch_performance_ad_spend(
         return out
 
     # ── CPC: SKU-кампании ("Трафареты", оплата за клик) ──────────────────────
+    # /statistics/products/sku (синхронный, "не расходует лимиты") принимает ТОЛЬКО
+    # today/yesterday — задокументировано ("dateFrom не раньше предыдущего дня") и
+    # подтверждено на реальном кабинете 03.08.2026 (400 "date range must contain only
+    # today or yesterday" для всех кампаний разом при более раннем периоде). Если
+    # запрошенный период уходит дальше вчера — используем асинхронный отчёт
+    # (fetch_cpc_report_async), иначе — быстрый синхронный путь как раньше.
     cpc_by_sku: dict[str, float] = {}
+    yesterday_iso = (date.today() - timedelta(days=1)).isoformat()
+    _cpc_needs_async = date_from < yesterday_iso
     try:
         campaigns = fetch_performance_campaigns(token)
         out["raw_campaigns_count"] = len(campaigns)
@@ -1606,9 +1746,21 @@ def fetch_performance_ad_spend(
             str(c.get("id")) for c in campaigns
             if isinstance(c, dict) and str(c.get("advObjectType") or "").upper() == "SKU"
         ]
-        if cpc_ids:
+        if cpc_ids and _cpc_needs_async:
+            cpc_result = fetch_cpc_report_async(token, cpc_ids, date_from, date_to)
+            cpc_by_sku = cpc_result.get("by_sku", {})
+            out["cpc_by_date"] = cpc_result.get("by_date", {})
+            out["cpc_source"] = "async"
+            out["cpc_raw_sample"] = cpc_result.get("raw_sample")
+            out["cpc_error_samples"] = cpc_result.get("chunks_failed", [])
+            out["cpc_campaigns_used"] = len(cpc_ids) if cpc_by_sku else 0
+            out["cpc_campaigns_failed"] = [] if cpc_by_sku else cpc_ids
+            # ok, если хоть что-то получили, ИЛИ вообще не было ошибок по кускам периода
+            out["cpc_ok"] = bool(cpc_by_sku) or not cpc_result.get("chunks_failed")
+        elif cpc_ids:
             cpc_by_sku, cpc_by_date, failed, error_samples = fetch_performance_sku_expense(token, cpc_ids, date_from, date_to)
             out["cpc_by_date"] = cpc_by_date
+            out["cpc_source"] = "sync"
             out["cpc_campaigns_used"] = len(cpc_ids) - len(failed)
             out["cpc_campaigns_failed"] = failed
             out["cpc_error_samples"] = error_samples
@@ -1852,7 +2004,7 @@ if "perf_ad_meta" not in st.session_state:
     st.session_state.perf_ad_meta = {
         "total": 0.0, "fetched": False, "error": None,
         "raw_campaigns_count": 0, "raw_campaigns_sample": [],
-        "cpc_total": 0.0, "cpc_ok": False, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {}, "cpc_by_date": {}, "cpc_error_samples": [],
+        "cpc_total": 0.0, "cpc_ok": False, "cpc_source": None, "cpc_campaigns_used": 0, "cpc_campaigns_failed": [], "cpc_by_sku": {}, "cpc_by_date": {}, "cpc_error_samples": [], "cpc_raw_sample": None,
         "cpo_total": 0.0, "cpo_ok": False, "cpo_source": None, "cpo_error": "", "cpo_raw_sample": None, "cpo_by_sku": {}, "cpo_by_date": {},
     }
 
@@ -2015,25 +2167,34 @@ if load_btn:
                                 f"(одна сумма CPC/CPO на весь магазин из Seller API)."
                             )
                         else:
+                            _cpc_src_label = {"sync": "быстрый, today/yesterday", "async": "отчёт по периоду"}.get(
+                                perf_result.get("cpc_source"), perf_result.get("cpc_source")
+                            )
                             st.success(
                                 f"🎯 Performance API: CPC {r(perf_result['cpc_total'])} "
-                                f"({'ок' if perf_result['cpc_ok'] else 'не удалось'}) + "
+                                f"({'ок, источник: ' + str(_cpc_src_label) if perf_result['cpc_ok'] else 'не удалось'}) + "
                                 f"CPO {r(perf_result['cpo_total'])} "
                                 f"({'ок, источник: ' + str(perf_result['cpo_source']) if perf_result['cpo_ok'] else 'не удалось'})"
                             )
                         if not perf_result["cpc_ok"]:
-                            st.warning(
-                                f"⚠️ CPC (оплата за клик): не удалось получить статистику "
-                                f"({len(perf_result['cpc_campaigns_failed'])} кампаний с ошибкой) — "
-                                f"эта часть расхода останется в «Расходах магазина» одной суммой."
-                            )
+                            if perf_result.get("cpc_source") == "async":
+                                st.warning(
+                                    "⚠️ CPC (оплата за клик): не удалось получить исторический отчёт за период — "
+                                    "эта часть расхода останется в «Расходах магазина» одной суммой."
+                                )
+                            else:
+                                st.warning(
+                                    f"⚠️ CPC (оплата за клик): не удалось получить статистику "
+                                    f"({len(perf_result['cpc_campaigns_failed'])} кампаний с ошибкой) — "
+                                    f"эта часть расхода останется в «Расходах магазина» одной суммой."
+                                )
                             if perf_result.get("cpc_error_samples"):
                                 with st.expander("🔍 Реальный текст ошибки от Performance API", expanded=True):
                                     st.dataframe(
                                         pd.DataFrame(perf_result["cpc_error_samples"]),
                                         use_container_width=True, hide_index=True,
                                     )
-                        elif perf_result["cpc_campaigns_failed"]:
+                        elif perf_result["cpc_campaigns_failed"] and perf_result.get("cpc_source") != "async":
                             st.warning(
                                 f"⚠️ CPC: {len(perf_result['cpc_campaigns_failed'])} из "
                                 f"{perf_result['cpc_campaigns_used'] + len(perf_result['cpc_campaigns_failed'])} "
@@ -2046,6 +2207,12 @@ if load_btn:
                                         pd.DataFrame(perf_result["cpc_error_samples"]),
                                         use_container_width=True, hide_index=True,
                                     )
+                        elif perf_result.get("cpc_source") == "async" and perf_result.get("cpc_error_samples"):
+                            with st.expander(f"🔍 Часть периода не подтянулась ({len(perf_result['cpc_error_samples'])} кусков) — детали"):
+                                st.dataframe(
+                                    pd.DataFrame(perf_result["cpc_error_samples"]),
+                                    use_container_width=True, hide_index=True,
+                                )
                         if perf_result["cpo_error"]:
                             st.warning(f"⚠️ CPO (оплата за заказ): {perf_result['cpo_error']}")
 
@@ -2060,6 +2227,13 @@ if load_btn:
                                     pd.DataFrame(perf_result["raw_campaigns_sample"]),
                                     use_container_width=True, hide_index=True,
                                 )
+                        if perf_result.get("cpc_raw_sample"):
+                            with st.expander(
+                                "🔍 Сырой пример строк CPC-отчёта за период (для диагностики — схема полей "
+                                "не задокументирована Ozon, парсинг может понадобиться поправить по этому примеру)",
+                                expanded=not perf_result["cpc_ok"],
+                            ):
+                                st.json(perf_result["cpc_raw_sample"])
                         if perf_result.get("cpo_raw_sample"):
                             with st.expander("🔍 Сырой пример строк CPO-отчёта (для диагностики)", expanded=bool(perf_result["cpo_error"])):
                                 st.json(perf_result["cpo_raw_sample"])
